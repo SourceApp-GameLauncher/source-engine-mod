@@ -47,6 +47,9 @@
 
 // HL2SB: flashlight turned on by default at spawn
 extern ConVar sv_flashlight_default;
+// HL2SB: replicated animation debug switch (defined in hl2mp_player_shared.cpp),
+// used by gesture/overlay probes in PostThink and HL2SB_AnimRestartGesture.
+extern ConVar hl2sb_anim_debug;
 
 CBaseEntity	 *g_pLastCombineSpawn = NULL;
 CBaseEntity	 *g_pLastRebelSpawn = NULL;
@@ -745,6 +748,30 @@ void CHL2MP_Player::PostThink( void )
 	}
 
 	m_PlayerAnimState.Update();
+
+	// HL2SB diagnostic: per-second dump of the SERVER-side gesture layers.
+	// The client DUMP showed received weight ~0 / cycle 0 while creation logs
+	// said wt=1.00 - this tells whether the server's own layer state decays to
+	// 1 tick of weight right after creation (then the send table is faithfully
+	// carrying garbage) or stays healthy (then the loss is client-side recv).
+	if ( hl2sb_anim_debug.GetBool() )
+	{
+		static float s_flHL2SBSvOverlayDump[MAX_PLAYERS + 1] = {};
+		int slot = entindex();
+		if ( slot >= 1 && slot <= MAX_PLAYERS && gpGlobals->curtime >= s_flHL2SBSvOverlayDump[slot] )
+		{
+			s_flHL2SBSvOverlayDump[slot] = gpGlobals->curtime + 1.0f;
+			Msg( "[HL2SB overlay/sv] DUMP: ply=%d count=%d\n", slot, GetNumAnimOverlays() );
+			for ( int k = 0; k < GetNumAnimOverlays(); k++ )
+			{
+				CAnimationLayer *pLayer = GetAnimOverlay( k );
+				Msg( "    [%d] seq=%d order=%d wt=%.4f cycle=%.4f prev=%.4f flags=%d\n",
+					 k, (int)pLayer->m_nSequence, (int)pLayer->m_nOrder,
+					 (float)pLayer->m_flWeight, (float)pLayer->m_flCycle,
+					 (float)pLayer->m_flPrevCycle, (int)pLayer->m_fFlags );
+			}
+		}
+	}
 
 	// HL2SB (2026-09-27): GM:UpdateAnimation( ply, velocity, maxSeqGroundSpeed )
 	// - animations.lua:197.  The base gamemode writes SetPlaybackRate and the
