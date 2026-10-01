@@ -28,6 +28,14 @@
 //-----------------------------------------------------------------------------
 // Globals
 //-----------------------------------------------------------------------------
+
+// HL2SB: fov_desired must be registered on the client as a USERINFO convar,
+// otherwise the engine never includes it in the client's userinfo and the
+// server (CGameRules::ClientSettingsChanged) never sees a value to apply via
+// SetDefaultFOV.  Stock HL2MP ships without this convar, which is why changing
+// FOV was a silent no-op in multiplayer / HL2SB.
+ConVar fov_desired( "fov_desired", "90", FCVAR_ARCHIVE | FCVAR_USERINFO, "Sets the base field-of-view.", true, 75.0, true, 110.0 );
+
 vgui::HScheme g_hVGuiCombineScheme = 0;
 
 
