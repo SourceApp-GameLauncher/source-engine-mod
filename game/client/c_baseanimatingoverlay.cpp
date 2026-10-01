@@ -326,7 +326,11 @@ void C_BaseAnimatingOverlay::AccumulateLayers( IBoneSetup &boneSetup, Vector pos
 	}
 	for (i = 0; i < m_AnimOverlay.Count(); i++)
 	{
-		if (m_AnimOverlay[i].m_nOrder < MAX_OVERLAYS)
+		// HL2SB: unsigned - m_nOrder comes from a freshly grown slot whose
+		// constructor never initializes it, and a negative heap leftover
+		// passes a signed < MAX_OVERLAYS test and turns the layer[] bucket
+		// lookup below into an out-of-bounds stack read (render crash).
+		if ((unsigned int)m_AnimOverlay[i].m_nOrder < MAX_OVERLAYS)
 		{
 			/*
 			Assert( layer[m_AnimOverlay[i].m_nOrder] == MAX_OVERLAYS );
@@ -458,20 +462,56 @@ void C_BaseAnimatingOverlay::AccumulateLayers( IBoneSetup &boneSetup, Vector pos
 #endif
 	}
 
-	// HL2SB diagnostic: once a second per player entity, dump the received
-	// layer vector and how the render gates classified it.  "remote" entries
-	// with count=0 mean the overlay data never arrived; count>0 with
-	// rendered=0 means it arrived but every layer failed a gate; rendered>0
-	// means it renders (and the problem is upstream of the renderer).
-	if ( hl2sb_anim_debug.GetBool() && entindex() > 0 && entindex() <= gpGlobals->maxClients )
+	// HL2SB diagnostic: dump the received layer vector for the players this
+	// client is looking at (everybody except the local player), so the log
+	// mirrors exactly what the player can see.  Scheduling:
+	//   * idle   - once a second (baseline noise kept low)
+	//   * active - 4x a second while any layer carries a sequence, so short
+	//              (~0.5-1s) gestures cannot slip between samples
+	//   * birth  - immediately when a layer goes 0 -> seq>0 (the exact
+	//              arrival frame; proves the update reached this client)
+	// count=0 means the overlay data never arrived; count>0 with rendered=0
+	// means it arrived but every layer failed a gate; rendered>0 means it
+	// renders (an invisible-gesture report is then a blending problem).
+	if ( hl2sb_anim_debug.GetBool() && entindex() > 0 && entindex() <= gpGlobals->maxClients
+		 && this != C_BasePlayer::GetLocalPlayer() )
 	{
 		static float s_flHL2SBOverlayDump[MAX_PLAYERS + 1] = {};
-		if ( gpGlobals->curtime >= s_flHL2SBOverlayDump[entindex()] )
+		static int s_nHL2SBLastSeenSeq[MAX_PLAYERS + 1] = {};
+
+		int iSlot = entindex();
+		int iLiveSeq = 0;
+		for ( int k = 0; k < m_AnimOverlay.Count(); k++ )
 		{
-			s_flHL2SBOverlayDump[entindex()] = gpGlobals->curtime + 1.0f;
-			bool bLocal = ( C_BasePlayer::GetLocalPlayer() == this );
-			Msg( "[HL2SB overlay/cl] DUMP: ent=%d %s count=%d nseq=%d rendered=%d badseq=%d zerowt=%d\n",
-				 entindex(), bLocal ? "local" : "remote", m_AnimOverlay.Count(),
+			if ( (int)m_AnimOverlay[k].m_nSequence > 0 )
+			{
+				iLiveSeq = (int)m_AnimOverlay[k].m_nSequence;
+				break;
+			}
+		}
+
+		const char *pszReason = NULL;
+		if ( iLiveSeq > 0 && s_nHL2SBLastSeenSeq[iSlot] == 0 )
+		{
+			pszReason = "BIRTH";	// first frame a sequence shows up
+		}
+		else
+		{
+			float flInterval = ( iLiveSeq > 0 ) ? 0.25f : 1.0f;	// active: 4Hz
+			if ( gpGlobals->curtime >= s_flHL2SBOverlayDump[iSlot] )
+			{
+				s_flHL2SBOverlayDump[iSlot] = gpGlobals->curtime + flInterval;
+				pszReason = ( iLiveSeq > 0 ) ? "ACTIVE" : "idle";
+			}
+		}
+		s_nHL2SBLastSeenSeq[iSlot] = iLiveSeq;
+
+		if ( pszReason )
+		{
+			player_info_t info;
+			const char *pszName = ( engine && engine->GetPlayerInfo( iSlot, &info ) ) ? info.name : "?";
+			Msg( "[HL2SB overlay/cl] DUMP(%s): watching ent=%d '%s' count=%d nseq=%d rendered=%d badseq=%d zerowt=%d\n",
+				 pszReason, iSlot, pszName, m_AnimOverlay.Count(),
 				 nSequences, hl2sb_nRendered, hl2sb_nBadSeq, hl2sb_nZeroWeight );
 			for ( int k = 0; k < m_AnimOverlay.Count(); k++ )
 			{
@@ -622,4 +662,54 @@ CStudioHdr *C_BaseAnimatingOverlay::OnNewModel()
 	}
 
 	return hdr;
+}
+
+//-----------------------------------------------------------------------------
+// HL2SB diagnostic: fires after a network update has been decoded into
+// m_AnimOverlay but BEFORE interpolation/rendering.  Compares against
+// the render-time DUMP(BIRTH/ACTIVE): if RECV never prints when the server
+// logs gesture/sv OK, the update never reached this client; if RECV prints
+// but DUMP never does, the data is clobbered between recv and render.
+//-----------------------------------------------------------------------------
+void C_BaseAnimatingOverlay::OnDataChanged( DataUpdateType_t updateType )
+{
+	BaseClass::OnDataChanged( updateType );
+
+	if ( !hl2sb_anim_debug.GetBool() )
+		return;
+	if ( entindex() <= 0 || entindex() > gpGlobals->maxClients )
+		return;
+	if ( this == C_BasePlayer::GetLocalPlayer() )
+		return;
+
+	// only report layer content that differs from the last report
+	static int s_nHL2SBLastRecvSeq[MAX_PLAYERS + 1] = {};
+	static int s_nHL2SBLastRecvOrder[MAX_PLAYERS + 1] = {};
+	static float s_flHL2SBLastRecvWt[MAX_PLAYERS + 1] = {};
+
+	int iSlot = entindex();
+	int iSeq = 0, iOrder = -1;
+	float flWt = 0.0f;
+	for ( int k = 0; k < m_AnimOverlay.Count(); k++ )
+	{
+		if ( (int)m_AnimOverlay[k].m_nSequence > 0 )
+		{
+			iSeq = (int)m_AnimOverlay[k].m_nSequence;
+			iOrder = (int)m_AnimOverlay[k].m_nOrder;
+			flWt = (float)m_AnimOverlay[k].m_flWeight;
+			break;
+		}
+	}
+
+	if ( iSeq == s_nHL2SBLastRecvSeq[iSlot] && iOrder == s_nHL2SBLastRecvOrder[iSlot] )
+		return;
+
+	s_nHL2SBLastRecvSeq[iSlot] = iSeq;
+	s_nHL2SBLastRecvOrder[iSlot] = iOrder;
+	s_flHL2SBLastRecvWt[iSlot] = flWt;
+
+	player_info_t info;
+	const char *pszName = ( engine && engine->GetPlayerInfo( iSlot, &info ) ) ? info.name : "?";
+	Msg( "[HL2SB overlay/cl] RECV: ent=%d '%s' seq=%d order=%d wt=%.4f\n",
+		 iSlot, pszName, iSeq, iOrder, flWt );
 }

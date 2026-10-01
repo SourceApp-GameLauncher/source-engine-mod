@@ -467,6 +467,7 @@ bool C_BaseCombatWeapon::ShouldDrawPickup( void )
 //			by this player, otherwise draw the worldmodel.
 //-----------------------------------------------------------------------------
 extern bool g_bRenderingReflection; // HL2SB: mirror reflection flag in viewrender.cpp
+extern ConVar hl2sb_anim_debug; // HL2SB: replicated probe switch (hl2mp_player_shared.cpp)
 
 int C_BaseCombatWeapon::DrawModel( int flags )
 {
@@ -525,18 +526,63 @@ int C_BaseCombatWeapon::DrawModel( int flags )
 		SetModelIndex( GetWorldModelIndex() );
 	}
 
+	// HL2SB diagnostic (hl2sb_anim_debug): draw-side state of every weapon
+	// entity - owner, parent link, world/local origin versus the owner, and
+	// the weapon's own sequence/cycle.  The "weapon lying in the world with
+	// its own animation" report only reproduces on this realm, so the split
+	// (owner lost / parent lost / stale origin) has to be read here; the
+	// server probe prints the same fields for comparison.
+	if ( hl2sb_anim_debug.GetBool() )
+	{
+		static float s_flHL2SBWpnClDump[MAX_EDICTS + 1] = {};
+		int iEnt = entindex();
+		if ( iEnt > 0 && iEnt <= MAX_EDICTS && gpGlobals->curtime >= s_flHL2SBWpnClDump[iEnt] )
+		{
+			s_flHL2SBWpnClDump[iEnt] = gpGlobals->curtime + 1.0f;
+
+			C_BaseEntity *pOwnerEnt = GetOwner();
+			C_BaseEntity *pParent = GetMoveParent();
+			C_BasePlayer *pLocal = C_BasePlayer::GetLocalPlayer();
+			const Vector &vHere = GetAbsOrigin();
+			const Vector &vLocalOrg = GetLocalOrigin();
+			const Vector &vOwner = pOwnerEnt ? pOwnerEnt->GetAbsOrigin() : vec3_origin;
+			// Bone-merge state: carried weapons render through EF_BONEMERGE
+			// onto the owner; fx bit / cache presence / hand-bone merge flag
+			// split "effect never arrived" from "cache not built" from
+			// "name match failed" - the three ways the model can end up
+			// rigid at the entity origin instead of riding the hand.
+			int iHandBone = LookupBone( "ValveBiped.Bip01_R_Hand" );
+			int iHandMerged = -1;
+			if ( m_pBoneMergeCache && iHandBone >= 0 )
+				iHandMerged = m_pBoneMergeCache->IsBoneMerged( iHandBone ) ? 1 : 0;
+			Msg( "[HL2SB wpns/cl] ent=%d wp=%s mine=%d owner=%d ownerpos=(%.0f %.0f %.0f) parent=%s#%d abs=(%.0f %.0f %.0f) local=(%.0f %.0f %.0f) seq=%d cyc=%.2f model=%s fx=0x%x cache=%d hand=%d merged=%d\n",
+				 iEnt, GetClassname(), ( pOwnerEnt == pLocal ) ? 1 : 0,
+				 pOwnerEnt ? pOwnerEnt->entindex() : -1,
+				 vOwner.x, vOwner.y, vOwner.z,
+				 pParent ? pParent->GetClassname() : "NONE",
+				 pParent ? pParent->entindex() : -1,
+				 vHere.x, vHere.y, vHere.z, vLocalOrg.x, vLocalOrg.y, vLocalOrg.z,
+				 GetSequence(), (float)GetCycle(),
+				 GetModel() ? modelinfo->GetModelName( GetModel() ) : "?",
+				 GetEffects(), m_pBoneMergeCache ? 1 : 0, iHandBone, iHandMerged );
+		}
+	}
+
 	// HL2SB: a c_ model used as a world model (GMod SWEPs point WorldModel at a
-	// c_ model rigged for viewmodel space) reads as "held" only when it plays
-	// the pose the viewmodel is playing -- by default it sits in sequence 0
-	// (reference pose), which is why the mirror showed a wrongly gripped gun.
-	// Sync pose by sequence NAME from the active viewmodel, so real w_ models
-	// (whose sequence tables differ) are left untouched.  Same ordering rule
-	// as the fixup above: the Lua dispatch must see the synced pose.
-	if ( IsCarriedByLocalPlayer() && g_bRenderingReflection )
+	// c_ model rigged for viewmodel space; the physgun's world answer is its
+	// own viewmodel string) reads as "held" only when it plays the pose the
+	// viewmodel is playing -- by default it sits in sequence 0 (reference
+	// pose), which is why the mirror showed a wrongly gripped gun.  Sync pose
+	// by sequence NAME from the active viewmodel whenever the world model IS
+	// the viewmodel's model (pointer equality - real w_ models differ and are
+	// left untouched), not only in reflections: normal third person draws this
+	// path every frame too.  Same ordering rule as the fixup above: the Lua
+	// dispatch must see the synced pose.
+	if ( IsCarriedByLocalPlayer() )
 	{
 		C_BasePlayer *pOwner = ToBasePlayer( GetOwner() );
 		C_BaseViewModel *pVM = pOwner ? pOwner->GetViewModel( 0 ) : NULL;
-		if ( pVM && GetModel() )
+		if ( pVM && GetModel() && pVM->GetModel() == GetModel() )
 		{
 			const char *pszSeqName = pVM->GetSequenceName( pVM->GetSequence() );
 			int iSeq = ( pszSeqName && pszSeqName[0] ) ? LookupSequence( pszSeqName ) : -1;
@@ -594,6 +640,36 @@ int C_BaseCombatWeapon::DrawModel( int flags )
 		lua_pop( L, 2 );
 	}
 #endif
+
+	// HL2SB diagnostic (hl2sb_anim_debug, second bucket): the world position
+	// of the merged hand bone right after the draw settles.  The pre-draw
+	// probe shows effects/cache/merge all healthy while the entity origin
+	// sits at the owner's WorldSpaceCenter - this line splits the two
+	// remaining stories: merged skinning in world space (bone rides the
+	// owner's gesture, origin irrelevant) versus the entity itself being
+	// what viewers see floating next to the owner.
+	{
+		static float s_flHL2SBWpnBoneDump[MAX_EDICTS + 1] = {};
+		int iEntB = entindex();
+		if ( hl2sb_anim_debug.GetBool() && iEntB > 0 && iEntB <= MAX_EDICTS && gpGlobals->curtime >= s_flHL2SBWpnBoneDump[iEntB] )
+		{
+			s_flHL2SBWpnBoneDump[iEntB] = gpGlobals->curtime + 1.0f;
+			int iHB = LookupBone( "ValveBiped.Bip01_R_Hand" );
+			if ( iHB >= 0 )
+			{
+				const matrix3x4_t &mBone = GetBone( iHB );
+				Vector vB;
+				MatrixGetColumn( mBone, 3, vB );
+				const Vector &vA = GetAbsOrigin();
+				Msg( "[HL2SB wpns/bone] ent=%d abs=(%.0f %.0f %.0f) handbone=(%.0f %.0f %.0f) seq=%d cyc=%.2f\n",
+					 iEntB, vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, GetSequence(), (float)GetCycle() );
+			}
+			else
+			{
+				Msg( "[HL2SB wpns/bone] ent=%d handbone=MISS (lookup=%d)\n", iEntB, iHB );
+			}
+		}
+	}
 
 	return BaseClass::DrawModel( flags );
 }

@@ -32,6 +32,7 @@
 
 
 extern bool g_bRenderingReflection; // HL2SB: mirror reflection flag in viewrender.cpp
+extern ConVar hl2sb_anim_debug; // HL2SB: replicated probe switch (hl2mp_player_shared.cpp)
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -389,6 +390,19 @@ bool C_BaseViewModel::ShouldDraw()
 #endif
 	else
 	{
+		// HL2SB: a viewmodel is only ever meant for its owner's screen - the
+		// server gates them to owner/in-eye spectators in ShouldTransmit. A
+		// remote viewmodel that reaches this client (transmit gate missed)
+		// renders as a weapon parked at its raw networked origin - never
+		// positioned, no move parent - while playing its owner's weapon
+		// animations, i.e. the "second weapon floating in the world" that
+		// keeps syncing with the other player's attacks. Draw only the local
+		// player's own viewmodel slots; HLTV/Replay in-eye above keep their
+		// reference behavior.
+		C_BasePlayer *pLocal = C_BasePlayer::GetLocalPlayer();
+		if ( pLocal && this != pLocal->GetViewModel( 0 ) && this != pLocal->GetViewModel( 1 ) )
+			return false;
+
 		return BaseClass::ShouldDraw();
 	}
 }
@@ -416,6 +430,39 @@ int C_BaseViewModel::DrawModel( int flags )
 
 	if ( !m_bReadyToDraw )
 		return 0;
+
+	// HL2SB diagnostic (hl2sb_anim_debug): viewmodels reach DrawModel for
+	// remote owners too - once a second print owner/parent/positions and the
+	// played sequence, to split a detached viewmodel (weapon model lying in
+	// the world playing its own animations) from the weapon-entity state in
+	// the wpns probes.  Local viewmodel stays quiet.
+	if ( hl2sb_anim_debug.GetBool() )
+	{
+		static float s_flHL2SBVmClDump[MAX_EDICTS + 1] = {};
+		int iEnt = entindex();
+		if ( iEnt > 0 && iEnt <= MAX_EDICTS && gpGlobals->curtime >= s_flHL2SBVmClDump[iEnt] )
+		{
+			s_flHL2SBVmClDump[iEnt] = gpGlobals->curtime + 1.0f;
+
+			C_BaseEntity *pOwnerEnt = GetOwnerEntity();
+			C_BaseEntity *pLocal = C_BasePlayer::GetLocalPlayer();
+			if ( pOwnerEnt != pLocal )
+			{
+				C_BaseEntity *pParent = GetMoveParent();
+				const Vector &vHere = GetAbsOrigin();
+				const Vector &vLocalOrg = GetLocalOrigin();
+				const Vector &vOwner = pOwnerEnt ? pOwnerEnt->GetAbsOrigin() : vec3_origin;
+				Msg( "[HL2SB vm/cl] ent=%d owner=%d ownerpos=(%.0f %.0f %.0f) parent=%s#%d abs=(%.0f %.0f %.0f) local=(%.0f %.0f %.0f) seq=%d cyc=%.2f model=%s\n",
+					 iEnt, pOwnerEnt ? pOwnerEnt->entindex() : -1,
+					 vOwner.x, vOwner.y, vOwner.z,
+					 pParent ? pParent->GetClassname() : "NONE",
+					 pParent ? pParent->entindex() : -1,
+					 vHere.x, vHere.y, vHere.z, vLocalOrg.x, vLocalOrg.y, vLocalOrg.z,
+					 GetSequence(), (float)GetCycle(),
+					 GetModel() ? modelinfo->GetModelName( GetModel() ) : "?" );
+			}
+		}
+	}
 
 	if ( flags & STUDIO_RENDER )
 	{
@@ -607,18 +654,27 @@ void C_BaseViewModel::PostDataUpdate( DataUpdateType_t updateType )
 //-----------------------------------------------------------------------------
 CStudioHdr *C_BaseViewModel::OnNewModel( void )
 {
+	// HL2SB (2026-10-02): GMod's contract is ENT:ViewModelChanged( vm, old, new )
+	// - capture the OLD model name before BaseClass swaps m_nModelIndex.
+	char szOldModel[ MAX_PATH ] = "";
+	if ( GetModel() != NULL )
+	{
+		const char *pszOld = modelinfo->GetModelName( GetModel() );
+		if ( pszOld != NULL )
+			Q_strncpy( szOldModel, pszOld, sizeof( szOldModel ) );
+	}
+
 	CStudioHdr *pResult = BaseClass::OnNewModel();
 #if defined( LUA_SDK )
 	// HL2SB (2026-09-27): GMod's engine hook (the name lives only in
 	// lua_shared's registry there -> by-ID dispatch; gmod_hands re-parents onto
 	// the fresh viewmodel through it).  Args mirror GMod's only consumer,
-	// ENT:ViewModelChanged( vm, old, new ) -- old is best-effort (we only know
-	// the model that is arriving).
+	// ENT:ViewModelChanged( vm, old, new ).
 	if ( L != NULL )
 	{
 		BEGIN_LUA_CALL_HOOK( "OnViewModelChanged" );
 			lua_pushentity( L, this );
-			lua_pushstring( L, "" );
+			lua_pushstring( L, szOldModel );
 			const char *pszModelName = modelinfo->GetModelName( GetModel() );
 			lua_pushstring( L, ( pszModelName != NULL ) ? pszModelName : "" );
 		END_LUA_CALL_HOOK( 3, 0 );

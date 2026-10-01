@@ -9,6 +9,7 @@
 #include "hl2mp_player.h"
 #include "player.h"
 #include "activitylist.h"
+#include "cdll_int.h"	// HL2SB: player_info_t for the gesture/overlay name probes
 #include "globalstate.h"
 #include "game.h"
 #include "gamerules.h"
@@ -44,12 +45,69 @@
 #include "SoundEmitterSystem/isoundemittersystembase.h"
 
 #include "ilagcompensationmanager.h"
+#include "basetempentity.h"		// HL2SB: CTEPlayerAnimEvent (GMod gesture broadcast)
+#include "recipientfilter.h"		// HL2SB: CPVSFilter for the same
 
 // HL2SB: flashlight turned on by default at spawn
 extern ConVar sv_flashlight_default;
 // HL2SB: replicated animation debug switch (defined in hl2mp_player_shared.cpp),
 // used by gesture/overlay probes in PostThink and HL2SB_AnimRestartGesture.
 extern ConVar hl2sb_anim_debug;
+
+// ============================================================================
+// HL2SB (2026-10-02): GMod gesture broadcast channel - CTEPlayerAnimEvent.
+//
+// GMod's DT_HL2MP_Player excludes DT_BaseAnimatingOverlay::overlay_vars, so
+// gesture layers are NEVER networked: every client builds them locally when
+// this tiny temp entity arrives (player handle + event + data - no layer
+// data at all).  This is what fixes "other players never play attack
+// animations": the old architecture networked the layers and the client-side
+// LATCH_ANIMATION_VAR interpolation clobbered them on remote entities
+// (phone RECV probe: correct first frame, zeroed 10ms later).
+//
+// Structure mirrors the in-tree CS/DOD CTEPlayerAnimEvent exactly (same
+// fields, same DT name); the single fire point is HL2SB_AnimRestartGesture
+// below, which sends PLAYERANIMEVENT_CUSTOM_GESTURE + the resolved
+// activity - the client lands it in GESTURE_SLOT_CUSTOM, matching GMod's
+// CMultiPlayerAnimState::DoAnimationEvent CUSTOM_GESTURE case.
+// ============================================================================
+class CTEPlayerAnimEvent : public CBaseTempEntity
+{
+public:
+	DECLARE_CLASS( CTEPlayerAnimEvent, CBaseTempEntity );
+	DECLARE_SERVERCLASS();
+
+	CTEPlayerAnimEvent( const char *name ) : CBaseTempEntity( name )
+	{
+	}
+
+	CNetworkHandle( CBasePlayer, m_hPlayer );
+	CNetworkVar( int, m_iEvent );
+	CNetworkVar( int, m_nData );
+};
+
+IMPLEMENT_SERVERCLASS_ST_NOBASE( CTEPlayerAnimEvent, DT_TEPlayerAnimEvent )
+	SendPropEHandle( SENDINFO( m_hPlayer ) ),
+	SendPropInt( SENDINFO( m_iEvent ), Q_log2( PLAYERANIMEVENT_COUNT ) + 1, SPROP_UNSIGNED ),
+	SendPropInt( SENDINFO( m_nData ), 32 )
+END_SEND_TABLE()
+
+static CTEPlayerAnimEvent g_TEPlayerAnimEvent( "PlayerAnimEvent" );
+
+void TE_PlayerAnimEvent( CBasePlayer *pPlayer, PlayerAnimEvent_t event, int nData )
+{
+	if ( !pPlayer )
+		return;
+
+	CPVSFilter filter( (const Vector &)pPlayer->EyePosition() );
+
+	g_TEPlayerAnimEvent.m_hPlayer = pPlayer;
+	g_TEPlayerAnimEvent.m_iEvent = event;
+	g_TEPlayerAnimEvent.m_nData = nData;
+	g_TEPlayerAnimEvent.Create( filter, 0 );
+}
+// ============================================================================
+
 
 CBaseEntity	 *g_pLastCombineSpawn = NULL;
 CBaseEntity	 *g_pLastRebelSpawn = NULL;
@@ -105,6 +163,14 @@ IMPLEMENT_SERVERCLASS_ST(CHL2MP_Player, DT_HL2MP_Player)
 
 	SendPropExclude( "DT_BaseAnimating", "m_flPoseParameter" ),
 	SendPropExclude( "DT_BaseFlex", "m_viewtarget" ),
+	// HL2SB (2026-10-02): GMod excludes this too - gesture/overlay layers are
+	// never networked for players.  Every client builds them locally from the
+	// CTEPlayerAnimEvent broadcast (see the class at the top of this file);
+	// networked layers were being zeroed by the client interpolation of
+	// remote entities, which is why other players never played attack
+	// animations.  Server-side layers are still created (slot bookkeeping,
+	// IsPlayingTaunt) - they are simply invisible to clients now.
+	SendPropExclude( "DT_BaseAnimatingOverlay", "overlay_vars" ),
 
 //	SendPropExclude( "DT_ServerAnimationData" , "m_flCycle" ),	
 //	SendPropExclude( "DT_AnimTimeMustBeFirst" , "m_flAnimTime" ),
@@ -757,20 +823,99 @@ void CHL2MP_Player::PostThink( void )
 	if ( hl2sb_anim_debug.GetBool() )
 	{
 		static float s_flHL2SBSvOverlayDump[MAX_PLAYERS + 1] = {};
+		static int s_nHL2SBSvLastSeq[MAX_PLAYERS + 1] = {};
 		int slot = entindex();
-		if ( slot >= 1 && slot <= MAX_PLAYERS && gpGlobals->curtime >= s_flHL2SBSvOverlayDump[slot] )
+		if ( slot >= 1 && slot <= MAX_PLAYERS )
 		{
-			s_flHL2SBSvOverlayDump[slot] = gpGlobals->curtime + 1.0f;
-			Msg( "[HL2SB overlay/sv] DUMP: ply=%d count=%d\n", slot, GetNumAnimOverlays() );
+			int iLiveSeq = 0;
 			for ( int k = 0; k < GetNumAnimOverlays(); k++ )
 			{
-				CAnimationLayer *pLayer = GetAnimOverlay( k );
-				Msg( "    [%d] seq=%d order=%d wt=%.4f cycle=%.4f prev=%.4f flags=%d\n",
-					 k, (int)pLayer->m_nSequence, (int)pLayer->m_nOrder,
-					 (float)pLayer->m_flWeight, (float)pLayer->m_flCycle,
-					 (float)pLayer->m_flPrevCycle, (int)pLayer->m_fFlags );
+				if ( (int)GetAnimOverlay( k )->m_nSequence > 0 )
+				{
+					iLiveSeq = (int)GetAnimOverlay( k )->m_nSequence;
+					break;
+				}
 			}
-		}
+
+			const char *pszReason = NULL;
+			if ( iLiveSeq > 0 && s_nHL2SBSvLastSeq[slot] == 0 )
+			{
+				pszReason = "BIRTH";	// creation frame (pairs with gesture/sv OK)
+			}
+			else
+			{
+				float flInterval = ( iLiveSeq > 0 ) ? 0.25f : 1.0f;
+				if ( gpGlobals->curtime >= s_flHL2SBSvOverlayDump[slot] )
+				{
+					s_flHL2SBSvOverlayDump[slot] = gpGlobals->curtime + flInterval;
+					pszReason = ( iLiveSeq > 0 ) ? "ACTIVE" : "idle";
+				}
+			}
+			s_nHL2SBSvLastSeq[slot] = iLiveSeq;
+
+				if ( pszReason )
+				{
+					player_info_t info;
+					const char *pszName = engine->GetPlayerInfo( slot, &info ) ? info.name : "?";
+					Msg( "[HL2SB overlay/sv] DUMP(%s): ply=%d '%s' count=%d\n", pszReason, slot, pszName, GetNumAnimOverlays() );
+					for ( int k = 0; k < GetNumAnimOverlays(); k++ )
+					{
+						CAnimationLayer *pLayer = GetAnimOverlay( k );
+						Msg( "    [%d] seq=%d order=%d wt=%.4f cycle=%.4f prev=%.4f flags=%d\n",
+							 k, (int)pLayer->m_nSequence, (int)pLayer->m_nOrder,
+							 (float)pLayer->m_flWeight, (float)pLayer->m_flCycle,
+							 (float)pLayer->m_flPrevCycle, (int)pLayer->m_fFlags );
+					}
+				}
+
+				// Active-weapon follow state: the "weapon lying in the world
+				// with its own animation" report is about the weapon ENTITY,
+				// not the gesture layers - the parent link plus both coordinate
+				// spaces (weapon world/local vs this player) split a lost
+				// server-side parent from a stale origin, and seq/cycle shows
+				// whether its own animation keeps advancing independently.
+				static float s_flHL2SBSvWeaponDump[MAX_PLAYERS + 1] = {};
+				if ( gpGlobals->curtime >= s_flHL2SBSvWeaponDump[slot] )
+				{
+					s_flHL2SBSvWeaponDump[slot] = gpGlobals->curtime + 1.0f;
+
+					CBaseCombatWeapon *pWpn = GetActiveWeapon();
+					player_info_t winfo;
+					const char *pszPlyName = engine->GetPlayerInfo( slot, &winfo ) ? winfo.name : "?";
+					// Viewmodel ownership: which server entities back this
+					// player's viewmodel slots - the client-side ghost is a
+					// viewmodel, so this pins whose it is.
+					CBaseViewModel *pVm0 = GetViewModel( 0, false );
+					CBaseViewModel *pVm1 = GetViewModel( 1, false );
+					if ( pWpn )
+					{
+						CBaseEntity *pParent = pWpn->GetMoveParent();
+						const Vector &vWpn = pWpn->GetAbsOrigin();
+						const Vector &vLocal = pWpn->GetLocalOrigin();
+						const Vector &vHere = GetAbsOrigin();
+						Msg( "[HL2SB wpns/sv] ply=%d '%s' wp=%s parent=%s#%d abs=(%.0f %.0f %.0f) local=(%.0f %.0f %.0f) here=(%.0f %.0f %.0f) seq=%d cyc=%.2f model=%s fx=0x%x follow=%d patt=%d pmodel=%s vm0=%d vm1=%d\n",
+							 slot, pszPlyName, pWpn->GetClassname(),
+							 pParent ? pParent->GetClassname() : "NONE",
+							 pParent ? pParent->entindex() : -1,
+							 vWpn.x, vWpn.y, vWpn.z, vLocal.x, vLocal.y, vLocal.z,
+							 vHere.x, vHere.y, vHere.z,
+							 pWpn->GetSequence(), (float)pWpn->GetCycle(),
+							 STRING( pWpn->GetModelName() ),
+							 pWpn->GetEffects(), pWpn->IsFollowingEntity() ? 1 : 0,
+							 pWpn->GetParentAttachment(),
+							 STRING( GetModelName() ),
+							 pVm0 ? pVm0->entindex() : -1,
+							 pVm1 ? pVm1->entindex() : -1 );
+					}
+					else
+					{
+						Msg( "[HL2SB wpns/sv] ply=%d '%s' wp=NONE vm0=%d vm1=%d\n",
+							 slot, pszPlyName,
+							 pVm0 ? pVm0->entindex() : -1,
+							 pVm1 ? pVm1->entindex() : -1 );
+					}
+				}
+			}
 	}
 
 	// HL2SB (2026-09-27): GM:UpdateAnimation( ply, velocity, maxSeqGroundSpeed )
@@ -965,6 +1110,37 @@ void CHL2MP_Player::HL2SB_AnimRestartGesture( int iSlot, Activity activity, bool
 		m_iHL2SBSlotActivity[iSlot] = ACT_INVALID;
 	}
 
+	// GMod gestures play through the weapon acttable (ACT_MP_ATTACK_* ->
+	// ACT_HL2MP_GESTURE_RANGE_ATTACK_<holdtype>); fall back to the bare
+	// activity for model-authored layer activities (ACT_GMOD_IN_CHAT,
+	// ACT_GMOD_NOCLIP_LAYER).
+	Activity translated = Weapon_TranslateActivity( activity );
+	int iSequence = SelectWeightedSequence( translated );
+	Activity broadcastAct = ( iSequence > 0 ) ? translated : activity;
+	if ( iSequence <= 0 )
+		iSequence = SelectWeightedSequence( activity );
+
+	// HL2SB (2026-10-02): GMod gesture broadcast - overlay_vars is excluded
+	// from the player send table, so THIS is the only way other clients ever
+	// see the gesture.  One broadcast per server-side gesture creation (Lua
+	// GM:DoAnimationEvent attacks/reloads, animations.lua land/chat, the act
+	// command, the C++ SetAnimation fallbacks - every path funnels through
+	// here).  The client receives CUSTOM_GESTURE + this activity and builds
+	// the layer locally in GESTURE_SLOT_CUSTOM.  The server layer created
+	// below still exists for IsPlayingTaunt/slot bookkeeping but is invisible
+	// (excluded from the send table).
+	//
+	// Broadcast the RESOLVED activity, not the caller's ideal: the client has
+	// no Weapon_TranslateActivity (server-only), so an ideal
+	// ACT_MP_ATTACK_STAND_PRIMARYFIRE that the model only carries as
+	// ACT_HL2MP_GESTURE_RANGE_ATTACK_<holdtype> dead-ends in the client's
+	// SelectWeightedSequence and the remote player never animates (two-player
+	// log: sv OK translated=... vs cl NO SEQUENCE ideal=...).  Activities the
+	// acttable leaves alone translate to themselves, so act/land/wave traffic
+	// is unchanged.  Above the replay/NO SEQUENCE returns so every funnel
+	// call broadcasts exactly once, including rapid-fire replays.
+	TE_PlayerAnimEvent( this, PLAYERANIMEVENT_CUSTOM_GESTURE, (int)broadcastAct );
+
 	// GMod's authoritative semantics (CMultiPlayerAnimState::RestartGesture,
 	// game/shared/Multiplayer/multiplayer_animstate.cpp:545): asking for the
 	// activity an active slot is ALREADY playing RESETS its cycle - it replays.
@@ -982,20 +1158,14 @@ void CHL2MP_Player::HL2SB_AnimRestartGesture( int iSlot, Activity activity, bool
 	if ( m_iHL2SBSlotLayer[iSlot] >= 0 )
 		RemoveLayer( m_iHL2SBSlotLayer[iSlot], 0.0f, 0.0f );
 
-	// GMod gestures play through the weapon acttable (ACT_MP_ATTACK_* ->
-	// ACT_HL2MP_GESTURE_RANGE_ATTACK_<holdtype>); fall back to the bare
-	// activity for model-authored layer activities (ACT_GMOD_IN_CHAT,
-	// ACT_GMOD_NOCLIP_LAYER).
-	Activity translated = Weapon_TranslateActivity( activity );
-	int iSequence = SelectWeightedSequence( translated );
-	if ( iSequence <= 0 )
-		iSequence = SelectWeightedSequence( activity );
 	if ( iSequence <= 0 )
 	{
 		if ( hl2sb_anim_debug.GetBool() )
 		{
-			Msg( "[HL2SB gesture/sv] NO SEQUENCE: ply=%d slot=%d act=%s translated=%s (model %s has no matching gesture activity - layer NOT created)\n",
-				 entindex(), iSlot, ActivityList_NameForIndex( (int)activity ),
+			player_info_t info;
+			const char *pszName = engine->GetPlayerInfo( entindex(), &info ) ? info.name : "?";
+			Msg( "[HL2SB gesture/sv] NO SEQUENCE: ply=%d '%s' slot=%d act=%s translated=%s (model %s has no matching gesture activity - layer NOT created)\n",
+				 entindex(), pszName, iSlot, ActivityList_NameForIndex( (int)activity ),
 				 ActivityList_NameForIndex( (int)translated ), STRING( GetModelName() ) );
 		}
 		m_iHL2SBSlotLayer[iSlot] = -1;
@@ -1018,8 +1188,10 @@ void CHL2MP_Player::HL2SB_AnimRestartGesture( int iSlot, Activity activity, bool
 
 	if ( hl2sb_anim_debug.GetBool() )
 	{
-		Msg( "[HL2SB gesture/sv] OK: ply=%d slot=%d act=%s translated=%s seq=%d layer=%d wt=%.2f\n",
-			 entindex(), iSlot, ActivityList_NameForIndex( (int)activity ),
+		player_info_t info;
+		const char *pszName = engine->GetPlayerInfo( entindex(), &info ) ? info.name : "?";
+		Msg( "[HL2SB gesture/sv] OK: ply=%d '%s' slot=%d act=%s translated=%s seq=%d layer=%d wt=%.2f\n",
+			 entindex(), pszName, iSlot, ActivityList_NameForIndex( (int)activity ),
 			 ActivityList_NameForIndex( (int)translated ), iSequence, iLayer,
 			 GetLayerWeight( iLayer ) );
 	}
@@ -1259,16 +1431,20 @@ void CHL2MP_Player::SetAnimation( PLAYER_ANIM playerAnim )
 		{
 			if ( hl2sb_anim_debug.GetBool() )
 			{
-				Msg( "[HL2SB gesture/sv] ATTACK1 path=Lua (GM:DoAnimationEvent answered) ply=%d\n",
-					 entindex() );
+				player_info_t info;
+				const char *pszName = engine->GetPlayerInfo( entindex(), &info ) ? info.name : "?";
+				Msg( "[HL2SB gesture/sv] ATTACK1 path=Lua (GM:DoAnimationEvent answered) ply=%d '%s'\n",
+					 entindex(), pszName );
 			}
 			return;
 		}
 
 		if ( hl2sb_anim_debug.GetBool() )
 		{
-			Msg( "[HL2SB gesture/sv] ATTACK1 path=C++ fallback (no Lua handler) ply=%d\n",
-				 entindex() );
+			player_info_t info;
+			const char *pszName = engine->GetPlayerInfo( entindex(), &info ) ? info.name : "?";
+			Msg( "[HL2SB gesture/sv] ATTACK1 path=C++ fallback (no Lua handler) ply=%d '%s'\n",
+				 entindex(), pszName );
 		}
 
 		if ( GetActivity( ) == ACT_HOVER	||
@@ -1382,7 +1558,10 @@ void CHL2MP_Player::SetAnimation( PLAYER_ANIM playerAnim )
 
 	if ( idealActivity == ACT_HL2MP_GESTURE_RANGE_ATTACK )
 	{
-		RestartGesture( Weapon_TranslateActivity( idealActivity ) );
+		// HL2SB (2026-10-02): routed through the funnel so the GMod gesture
+		// broadcast (TE PlayerAnimEvent) fires for the no-Lua-gamemode path
+		// too; the funnel applies Weapon_TranslateActivity itself.
+		HL2SB_AnimRestartGesture( GESTURE_SLOT_ATTACK_AND_RELOAD, idealActivity, true );
 
 		// HL2SB (2026-09-30): Lua SWEPs skip this.  CBaseCombatWeapon::
 		// SetActivity is Valve's own "Oh man..." hack -- it flips the weapon
@@ -1404,7 +1583,8 @@ void CHL2MP_Player::SetAnimation( PLAYER_ANIM playerAnim )
 	}
 	else if ( idealActivity == ACT_HL2MP_GESTURE_RELOAD )
 	{
-		RestartGesture( Weapon_TranslateActivity( idealActivity ) );
+		// HL2SB (2026-10-02): funnel - same translation + gesture broadcast.
+		HL2SB_AnimRestartGesture( GESTURE_SLOT_ATTACK_AND_RELOAD, idealActivity, true );
 		return;
 	}
 	else
