@@ -48,7 +48,7 @@ CLoadingDialog::CLoadingDialog( vgui::Panel *parent ) : Frame(parent, "LoadingDi
 	}
 
 	// center the loading dialog, unless we have another dialog to show in the background
-	m_bCenter = !GameUI().HasLoadingBackgroundDialog();
+	m_bCenter = false;
 
 	m_bShowingSecondaryProgress = false;
 	m_flSecondaryProgress = 0.0f;
