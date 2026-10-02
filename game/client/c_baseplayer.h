@@ -418,6 +418,13 @@ protected:
 public:
 	int m_StuckLast;
 	
+	// HL2SB (2026-10-02): armor.  Mirrored from the server's
+	// CBasePlayer::m_ArmorValue via the DT_BasePlayer RecvProp below.
+	// tarkovhud.lua:144 calls ply:Armor() and had no value source before.
+	int m_ArmorValue;
+	int  ArmorValue() const { return m_ArmorValue; }
+	void SetArmorValue( int value ) { m_ArmorValue = value; }
+
 	// Data for only the local player
 	CNetworkVarEmbedded( CPlayerLocalData, m_Local );
 

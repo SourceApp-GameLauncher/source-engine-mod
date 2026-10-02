@@ -1044,9 +1044,11 @@ private:
 	// Multiplayer handling
 	PlayerConnectedState	m_iConnected;
 
-	// from edict_t
-	// CBasePlayer doesn't send this but CCSPlayer does.
-	CNetworkVarForDerived( int, m_ArmorValue );
+    // from edict_t
+    // HL2SB: changed from CNetworkVarForDerived to CNetworkVar so CBasePlayer
+    // itself can send the value in DT_BasePlayer (the client has no armor data
+    // otherwise, which is what made Player:Armor() a nil method for tarkovhud).
+    CNetworkVar( int, m_ArmorValue );
 	float					m_AirFinished;
 	float					m_PainFinished;
 

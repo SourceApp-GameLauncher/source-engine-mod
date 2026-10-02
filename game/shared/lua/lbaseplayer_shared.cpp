@@ -483,6 +483,44 @@ static int CBasePlayer_GetHealth (lua_State *L) {
   return 1;
 }
 
+// HL2SB (2026-10-02) GMod compat: Player:Armor() / GetArmor() / SetArmor() /
+// GetMaxArmor() / SetMaxArmor().
+//
+// tarkovhud.lua:144 (the shipped EFT HUD) reads ply:Armor() and threw
+// "attempt to call a nil value (method 'Armor')" every HUDPaint frame -- the
+// hook kept erroring on every tick because hook.lua now (correctly) no longer
+// removes erroring hooks.
+//
+// The engine value is CBasePlayer::m_ArmorValue (a CNetworkVar on the server,
+// mirrored client-side via the new DT_BasePlayer RecvProp).  ArmorValue() /
+// SetArmorValue() are server-side accessors; the client mirror added the same
+// pair in c_baseplayer.h.  This file is shared, so both realms resolve them.
+//
+// GetMaxArmor answers 100 -- this fork has no max-armor concept, and hard-
+// returning 100 (rather than 0) keeps Armor / MaxArmor from producing NaN in
+// tarkovhud's math.Clamp.  SetMaxArmor exists for API parity only.
+static int CBasePlayer_Armor (lua_State *L) {
+  lua_pushinteger(L, luaL_checkplayer(L, 1)->ArmorValue());
+  return 1;
+}
+
+static int CBasePlayer_SetArmor (lua_State *L) {
+  luaL_checkplayer(L, 1)->SetArmorValue(luaL_checkint(L, 2));
+  return 0;
+}
+
+static int CBasePlayer_GetMaxArmor (lua_State *L) {
+  luaL_checkplayer(L, 1);
+  lua_pushinteger(L, 100);
+  return 1;
+}
+
+static int CBasePlayer_SetMaxArmor (lua_State *L) {
+  luaL_checkplayer(L, 1);
+  (void)luaL_checkint(L, 2);
+  return 0;
+}
+
 static int CBasePlayer_GetImpulse (lua_State *L) {
   lua_pushinteger(L, luaL_checkplayer(L, 1)->GetImpulse());
   return 1;
@@ -2232,6 +2270,11 @@ static const luaL_Reg CBasePlayermeta[] = {
   {"GetFOVDistanceAdjustFactor", CBasePlayer_GetFOVDistanceAdjustFactor},
   {"GetFOVTime", CBasePlayer_GetFOVTime},
   {"GetHealth", CBasePlayer_GetHealth},
+  {"Armor", CBasePlayer_Armor}, // HL2SB GMod compat: armor accessors -- tarkovhud.lua:144 needs Armor().
+  {"GetArmor", CBasePlayer_Armor},
+  {"SetArmor", CBasePlayer_SetArmor},
+  {"GetMaxArmor", CBasePlayer_GetMaxArmor},
+  {"SetMaxArmor", CBasePlayer_SetMaxArmor},
   {"GetImpulse", CBasePlayer_GetImpulse},
   {"GetLaggedMovementValue", CBasePlayer_GetLaggedMovementValue},
   {"GetLastKnownPlaceName", CBasePlayer_GetLastKnownPlaceName},

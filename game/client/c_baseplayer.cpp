@@ -278,11 +278,14 @@ END_RECV_TABLE()
 		RecvPropEHandle( RECVINFO(m_hUseEntity) ),
 
 		RecvPropInt		(RECVINFO(m_iHealth)),
-		// HL2SB: must stay immediately after m_iHealth here AND in the server's
-		// DT_BasePlayer (game/server/player.cpp) -- recv props are matched to send
-		// props by INDEX, not by name.
-		RecvPropInt		(RECVINFO(m_iMaxHealth)),
-		RecvPropInt		(RECVINFO(m_lifeState)),
+        // HL2SB: must stay immediately after m_iHealth here AND in the server's
+        // DT_BasePlayer (game/server/player.cpp) -- recv props are matched to send
+        // props by INDEX, not by name.
+        RecvPropInt		(RECVINFO(m_iMaxHealth)),
+        // HL2SB (2026-10-02): mirrors the server SendProp added in the same slot.
+        // Feeds Player:Armor() (tarkovhud.lua:144).
+        RecvPropInt		(RECVINFO(m_ArmorValue)),
+        RecvPropInt		(RECVINFO(m_lifeState)),
 
 		RecvPropInt		(RECVINFO(m_iBonusProgress)),
 		RecvPropInt		(RECVINFO(m_iBonusChallenge)),
