@@ -67,6 +67,7 @@ static ConVar cl_drawownshadow("cl_drawownshadow", "0", FCVAR_ARCHIVE, "Render t
 #include "cliententitylist.h"			// HL2SB_RPC: entity index -> C_BaseEntity
 #endif
 
+#include "ammodef.h"
 
 // HL2SB: local prototype -- deliberately NOT added to luasrclib.h: a header
 // touch there would force a full-tree rebuild (waf has no header dependency
@@ -814,6 +815,20 @@ static int lua_game_IsDedicated (lua_State *L) {
   lua_pushboolean( L, engine->IsDedicatedServer() != 0 );
 #endif
   return 1;
+}
+
+static int lua_game_GetAmmoName( lua_State *L )
+{
+    int iAmmoType = luaL_checkint( L, 1 );
+    CAmmoDef *pAmmoDef = GetAmmoDef();
+    if ( pAmmoDef == NULL || iAmmoType < 0 )
+    {
+        lua_pushstring( L, "Unknown" );
+        return 1;
+    }
+    Ammo_t *pAmmo = pAmmoDef->GetAmmoOfIndex( iAmmoType );
+    lua_pushstring( L, ( pAmmo && pAmmo->pName ) ? pAmmo->pName : "Unknown" );
+    return 1;
 }
 
 //-----------------------------------------------------------------------------
@@ -2392,6 +2407,7 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
     lua_pushcfunction( L, lua_game_GetMap );       lua_setfield( L, -2, "GetMap" );
     lua_pushcfunction( L, lua_game_SinglePlayer ); lua_setfield( L, -2, "SinglePlayer" );
     lua_pushcfunction( L, lua_game_IsDedicated );  lua_setfield( L, -2, "IsDedicated" );
+    lua_pushcfunction( L, lua_game_GetAmmoName );  lua_setfield( L, -2, "GetAmmoName" );  // ← 新增
   }
   lua_pop( L, 1 );
 
