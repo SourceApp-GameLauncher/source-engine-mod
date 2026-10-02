@@ -31,6 +31,7 @@ ConVar physgun_drawbeams( "physgun_drawbeams", "1", FCVAR_ARCHIVE, "Draw the phy
 #include <utlstack.h>
 #include "beamdraw.h"
 #include "materialsystem/limaterial.h"
+#include "colorcorrectionmgr.h"
 #include "iviewrender_beams.h"
 #include <mathlib/lvmatrix.h>
 // HL2SB: g_pStudioRender, for render.SetLocalModelLights (declared in istudiorender.h:383).
@@ -841,6 +842,186 @@ static int cam_End3D2D (lua_State *L) {
 	pRenderContext->MatrixMode( MATERIAL_MODEL );
 	pRenderContext->PopMatrix();
 	return 0;
+}
+
+// ============================================================================
+// HL2SB GMod compat: 全局 DrawColorModify( tbl )
+//
+// GMod 的后处理函数，把一组 "$pp_colour_*" 参数推给屏幕空间颜色校正管线。
+// tarkovhud.lua:1262（EFT HUD 的死亡变暗）从 HUDPaint 直接调它；缺失时报
+//   "attempt to call a nil value (global 'DrawColorModify')"
+// 并让整个 HUDPaint 钩子失败。
+//
+// ⚠️ 本分支的 CColorCorrectionMgr 只有 lookup table + weight，没有
+// SetColorCorrection(add, multiply, brightness, contrast, saturation)，
+// 所以参数不能喂给它。GMod 的 DrawColorModify 走的是屏幕空间材质
+// （color_modify shader 的 $pp_colour_* IMaterialVar），本实现复用同一路径：
+//
+//   HUDPaint 里 DrawColorModify( tbl )  -> 存参数到 s_PendingColorModify，挂起
+//   下一帧 RenderScreenspaceEffects  -> lua_ApplyPendingColorModify 把它们
+//                                      写进材质、画一个全屏 quad
+//
+// 这就是 GMod 的语义 —— DrawColorModify 是延迟的，不是立即画。
+// ============================================================================
+
+struct HL2SB_ColorModify_t
+{
+    bool  bPending;
+    float add[3];
+    float multiply[3];
+    float brightness;
+    float contrast;
+    float saturation;
+};
+
+static HL2SB_ColorModify_t s_PendingColorModify = {
+    false,
+    { 0.0f, 0.0f, 0.0f },
+    { 0.0f, 0.0f, 0.0f },
+    0.0f,   // brightness
+    1.0f,   // contrast
+    1.0f    // saturation
+};
+
+// 材质路径可通过 ConVar 覆盖（默认 dev/color_modify，Source SDK 自带 VMT）。
+static ConVar hl2sb_colormodify_material(
+    "hl2sb_colormodify_material",
+    "dev/color_modify",
+    FCVAR_ARCHIVE,
+    "Material used by the global DrawColorModify()" );
+
+// 从 Lua 表（栈索引 1）读一个数字键，缺省时用 flDefault。
+static float HL2SB_ColorModifyField( lua_State *L, const char *pszKey, float flDefault )
+{
+    lua_getfield( L, 1, pszKey );
+    const float flValue = lua_isnumber( L, -1 ) ? (float)lua_tonumber( L, -1 ) : flDefault;
+    lua_pop( L, 1 );
+    return flValue;
+}
+
+// RenderScreenspaceEffects 回调：把挂起的参数写进材质并画全屏 quad。
+// 每次只画一帧 —— DrawColorModify 是"设定下一帧的颜色校正"语义，
+// 后续 HUDPaint 若继续调用会重新挂起。
+static int lua_ApplyPendingColorModify( lua_State *L )
+{
+    if ( !s_PendingColorModify.bPending )
+        return 0;
+
+    s_PendingColorModify.bPending = false;
+
+    IMaterial *pMaterial = materials->FindMaterial(
+        hl2sb_colormodify_material.GetString(),
+        TEXTURE_GROUP_CLIENT_EFFECTS );
+
+    if ( pMaterial == NULL || pMaterial->IsErrorMaterial() )
+    {
+        // 只警告一次，不要每帧刷屏。
+        static bool s_bWarned = false;
+        if ( !s_bWarned )
+        {
+            s_bWarned = true;
+            Warning( "[HL2SB] DrawColorModify: material '%s' not found; effect skipped. "
+                     "Set hl2sb_colormodify_material to a valid color_modify VMT.\n",
+                     hl2sb_colormodify_material.GetString() );
+        }
+        return 0;
+    }
+
+    bool bFound = false;
+    IMaterialVar *pVar = NULL;
+
+    pVar = pMaterial->FindVar( "$pp_colour_addr", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.add[0] );
+
+    pVar = pMaterial->FindVar( "$pp_colour_addg", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.add[1] );
+
+    pVar = pMaterial->FindVar( "$pp_colour_addb", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.add[2] );
+
+    pVar = pMaterial->FindVar( "$pp_colour_mulr", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.multiply[0] );
+
+    pVar = pMaterial->FindVar( "$pp_colour_mulg", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.multiply[1] );
+
+    pVar = pMaterial->FindVar( "$pp_colour_mulb", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.multiply[2] );
+
+    pVar = pMaterial->FindVar( "$pp_colour_brightness", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.brightness );
+
+    pVar = pMaterial->FindVar( "$pp_colour_contrast", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.contrast );
+
+    pVar = pMaterial->FindVar( "$pp_colour_colour", &bFound, false );
+    if ( bFound && pVar ) pVar->SetFloatValue( s_PendingColorModify.saturation );
+
+    CMatRenderContextPtr pRenderContext( materials );
+    pRenderContext->DrawScreenSpaceQuad( pMaterial );
+
+    return 0;
+}
+
+// 首次调用 DrawColorModify 时延迟注册 RenderScreenspaceEffects 回调。
+// 不能在 luaopen_render 里注册：那时 Lua 的 hook 模块还没被加载，
+// hook.Add 还不存在。放到第一次调用时再注册，成功才置位，失败下次重试。
+static void HL2SB_EnsureColorModifyHook( lua_State *L )
+{
+    static bool s_bRegistered = false;
+    if ( s_bRegistered )
+        return;
+
+    lua_getglobal( L, "hook" );
+    if ( !lua_istable( L, -1 ) )
+    {
+        lua_pop( L, 1 );
+        return;     // hook 模块还没加载；下次调用再试
+    }
+
+    lua_getfield( L, -1, "Add" );
+    if ( !lua_isfunction( L, -1 ) )
+    {
+        lua_pop( L, 2 );
+        return;
+    }
+
+    lua_remove( L, -2 );            // [hook.Add]
+    lua_pushstring( L, "RenderScreenspaceEffects" );
+    lua_pushstring( L, "HL2SB_DrawColorModify" );
+    lua_pushcfunction( L, lua_ApplyPendingColorModify );
+
+    if ( lua_pcall( L, 3, 0, 0 ) != 0 )
+    {
+        Warning( "[HL2SB] DrawColorModify: hook.Add failed: %s\n",
+                 lua_tostring( L, -1 ) );
+        lua_pop( L, 1 );
+        return;
+    }
+
+    s_bRegistered = true;
+}
+
+// DrawColorModify( tbl )：读表、挂起，并在首次调用时注册后处理钩子。
+static int lua_DrawColorModify( lua_State *L )
+{
+    luaL_checktype( L, 1, LUA_TTABLE );
+
+    // 延迟注册（hook 模块可能在 luaopen_render 之后才加载）。
+    HL2SB_EnsureColorModifyHook( L );
+
+    s_PendingColorModify.add[0]      = HL2SB_ColorModifyField( L, "$pp_colour_addr",       0.0f );
+    s_PendingColorModify.add[1]      = HL2SB_ColorModifyField( L, "$pp_colour_addg",       0.0f );
+    s_PendingColorModify.add[2]      = HL2SB_ColorModifyField( L, "$pp_colour_addb",       0.0f );
+    s_PendingColorModify.multiply[0] = HL2SB_ColorModifyField( L, "$pp_colour_mulr",       0.0f );
+    s_PendingColorModify.multiply[1] = HL2SB_ColorModifyField( L, "$pp_colour_mulg",       0.0f );
+    s_PendingColorModify.multiply[2] = HL2SB_ColorModifyField( L, "$pp_colour_mulb",       0.0f );
+    s_PendingColorModify.brightness  = HL2SB_ColorModifyField( L, "$pp_colour_brightness", 0.0f );
+    s_PendingColorModify.contrast    = HL2SB_ColorModifyField( L, "$pp_colour_contrast",   1.0f );
+    s_PendingColorModify.saturation  = HL2SB_ColorModifyField( L, "$pp_colour_colour",     1.0f );
+    s_PendingColorModify.bPending    = true;
+
+    return 0;
 }
 
 static const luaL_Reg cam_funcs[] = {
@@ -1968,11 +2149,23 @@ LUALIB_API int luaopen_render( lua_State *L )
     LUA_REGISTRATION_COMMIT_LIBRARY( Renders );
 
 #ifdef CLIENT_DLL
+    // HL2SB GMod compat: 全局 DrawColorModify( tbl )。
+    // 与 DrawMotionBlur / DrawToyTown 同类，是 GMod 的全局后处理入口，
+    // 不是 render.* 库成员，所以用 lua_setglobal 而不是 LUA_BINDING。
+    lua_pushcfunction( L, lua_DrawColorModify );
+    lua_setglobal( L, "DrawColorModify" );
+
     // HL2SB: the cam library -- cam.Start( {type="3D"/"2D", ...} ) / cam.End() /
     // cam.IgnoreZ().  The content render.lua shim builds cam.Start3D/Start2D on
     // top of these.
     luaL_register( L, "cam", cam_funcs );
     lua_pop( L, 1 );
+
+    // HL2SB GMod compat: global DrawColorModify( tbl ).
+    // 与 DrawMotionBlur / DrawToyTown 同类，是 GMod 的全局后处理入口，
+    // 不是 render.* 库成员。
+    lua_pushcfunction( L, lua_DrawColorModify );
+    lua_setglobal( L, "DrawColorModify" );
 
     LUA_SET_ENUM_LIB_BEGIN( L, "CULL_MODE" );
     lua_pushenum( L, MaterialCullMode_t::MATERIAL_CULLMODE_CCW, "COUNTER_CLOCKWISE" );
