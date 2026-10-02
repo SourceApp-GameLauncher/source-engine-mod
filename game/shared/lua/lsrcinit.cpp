@@ -13,6 +13,7 @@
 
 #include "luasrclib.h"
 #include "lauxlib.h"
+#include "lsql.h"
 
 // HL2SB: game.AddParticles() below drives the particle system manager directly.
 #include "particles/particles.h"
@@ -67,7 +68,9 @@ static ConVar cl_drawownshadow("cl_drawownshadow", "0", FCVAR_ARCHIVE, "Render t
 #include "cliententitylist.h"			// HL2SB_RPC: entity index -> C_BaseEntity
 #endif
 
+// HL2SB (2026-10-02): game.GetAmmoName reads the shared ammo def.
 #include "ammodef.h"
+
 
 // HL2SB: local prototype -- deliberately NOT added to luasrclib.h: a header
 // touch there would force a full-tree rebuild (waf has no header dependency
@@ -190,6 +193,12 @@ static const luaL_Reg luasrclibs[] = {
   // HL2SB: ported from Experiment: Source.
   {LUA_PARTICLESYSTEMLIBNAME, luaopen_ParticleSystem},
   {LUA_SYSTEMSLIBNAME, luaopen_Systems},
+  // HL2SB: SQLite-backed sql library (C side: sql.Query / sql.QueryTyped in
+  // lsql.cpp, which also maintains sql.m_strError).  The rest of GMod's sql
+  // surface -- SQLStr, TableExists, IndexExists, QueryRow, QueryValue, Begin,
+  // Commit, LastError -- is Lua in lua/includes/util/sql.lua, which
+  // includes/init.lua loads right after util.lua, so this must open first.
+  {"sql", luaopen_Sql},
   // HL2SB: ported from Experiment: Source.  `Entities` is merged onto the same
   // global table as the Team Sandbox era `ents` (Create/GetByIndex).
   {LUA_ENTITIESLIBNAME, luaopen_Entities},
@@ -752,16 +761,16 @@ static int lua_game_AddParticles (lua_State *L) {
   }
 
   if ( g_pParticleSystemMgr == NULL ) {
-    Warning( "[HL2SB] game.AddParticles: particle system manager not ready, '%s' not loaded\n", pszParticleFile );
+    luasrc_LuaWarnMsgF( "[HL2SB] game.AddParticles: particle system manager not ready, '%s' not loaded\n", pszParticleFile );
   }
   else if ( !filesystem->FileExists( pszParticleFile, "GAME" ) ) {
-    Warning( "[HL2SB] game.AddParticles: '%s' is not in the search paths - its particle systems stay unknown\n", pszParticleFile );
+    luasrc_LuaWarnMsgF( "[HL2SB] game.AddParticles: '%s' is not in the search paths - its particle systems stay unknown\n", pszParticleFile );
   }
   else {
     bLoaded = g_pParticleSystemMgr->ReadParticleConfigFile( pszParticleFile, true, false );
 
     if ( !bLoaded ) {
-      Warning( "[HL2SB] game.AddParticles: '%s' exists but could not be parsed\n", pszParticleFile );
+      luasrc_LuaWarnMsgF( "[HL2SB] game.AddParticles: '%s' exists but could not be parsed\n", pszParticleFile );
     }
   }
 
@@ -817,18 +826,21 @@ static int lua_game_IsDedicated (lua_State *L) {
   return 1;
 }
 
-static int lua_game_GetAmmoName( lua_State *L )
-{
-    int iAmmoType = luaL_checkint( L, 1 );
-    CAmmoDef *pAmmoDef = GetAmmoDef();
-    if ( pAmmoDef == NULL || iAmmoType < 0 )
-    {
-        lua_pushstring( L, "Unknown" );
-        return 1;
-    }
-    Ammo_t *pAmmo = pAmmoDef->GetAmmoOfIndex( iAmmoType );
-    lua_pushstring( L, ( pAmmo && pAmmo->pName ) ? pAmmo->pName : "Unknown" );
-    return 1;
+// HL2SB (2026-10-02) GMod compat: game.GetAmmoName( ammoID ) -> string|nil.
+// Wiki: "Returns the ammo name for given ammo type ID ... or nil if ammo type
+// ID is invalid."  Complements Player:GiveAmmo's numeric form, whose pickup
+// notification now resolves through the same ammo def.
+static int lua_game_GetAmmoName (lua_State *L) {
+  const int iAmmoType = luaL_checkint( L, 1 );
+  CAmmoDef *pAmmoDef = GetAmmoDef();
+  Ammo_t *pAmmo = ( pAmmoDef != NULL && iAmmoType >= 0 )
+    ? pAmmoDef->GetAmmoOfIndex( iAmmoType ) : NULL;
+  if ( pAmmo == NULL || pAmmo->pName == NULL || pAmmo->pName[ 0 ] == '\0' ) {
+    lua_pushnil( L );
+  } else {
+    lua_pushstring( L, pAmmo->pName );
+  }
+  return 1;
 }
 
 //-----------------------------------------------------------------------------
@@ -1722,6 +1734,16 @@ static void __MsgFunc_HL2SB_NW( bf_read &read )
 // would show the pickup popup (hidePopup == false); the client turns it into
 // the shared HUDAmmoPickedUp hook, which the GMod base gamemode normally draws
 // (wiki GM:HUDAmmoPickedUp -- "Called when the client has picked up ammo").
+//
+// HL2SB (2026-10-02): dispatch through hook.Run, not hook.call.  hook.lua's
+// call() signature is ( eventName, gamemodeTable, ... ) -- the old three-value
+// push put the ammo NAME into the gamemode slot and left the amount as the
+// only vararg, so every registered callback received ( amount, nil ) and any
+// addon reading the second argument raised "concatenate a nil value" on each
+// pickup.  hook.Run( name, ... ) forwards ( ammoName, amount ) to registered
+// hooks and then falls back to GM:HUDAmmoPickedUp, which is exactly the GMod
+// contract.  Stack discipline matches __MsgFunc_HL2SB_RPC below: snapshot the
+// top and restore unconditionally instead of hand-counting pops.
 static void __MsgFunc_HL2SB_AMMO( bf_read &read )
 {
 	char szName[ 128 ];
@@ -1734,21 +1756,21 @@ static void __MsgFunc_HL2SB_AMMO( bf_read &read )
 	if ( L == NULL )
 		return;
 
+	const int iBase = lua_gettop( L );
+
 	lua_getglobal( L, "hook" );
 	if ( lua_istable( L, -1 ) ) {
-		lua_getfield( L, -1, "call" );
+		lua_getfield( L, -1, "Run" );
 		if ( lua_isfunction( L, -1 ) ) {
 			lua_remove( L, -2 );
 			lua_pushstring( L, "HUDAmmoPickedUp" );
 			lua_pushstring( L, szName );
 			lua_pushinteger( L, nAmount );
 			luasrc_pcall( L, 3, 0, 0 );
-		} else {
-			lua_pop( L, 1 );
 		}
-	} else {
-		lua_pop( L, 1 );
 	}
+
+	lua_settop( L, iBase );		// unconditional restore
 }
 
 // HL2SB (2026-09-22): Entity:CallOnClient( name, data ) receiver -- the server
@@ -2181,7 +2203,7 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
     // "function" while the Lua probe still says nil, something between
     // openlibs and the extension scan REMOVES or shadows the global.
     lua_getglobal( L, szName );
-    Warning( "[HL2SB] openlibs: DEFINE_BASECLASS registered as %s\n",
+    luasrc_LuaWarnMsgF( "[HL2SB] openlibs: DEFINE_BASECLASS registered as %s\n",
              luaL_typename( L, -1 ) );
     lua_pop( L, 1 );
   }
@@ -2283,8 +2305,8 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
   if ( luaL_loadstring( L,
     "AddCSLuaFile = AddCSLuaFile or function( path ) return path end\n"
     "IncludeCS = IncludeCS or function( path ) return path end\n"
-    // HL2SB (sbrust): 补 arch 字段（GMod jit.arch 取值：x86/x64/arm/arm64）--
-    // util.IsBinaryModuleInstalled 的后缀公式吃它，32/64 位不再共用一个槽位。
+    // HL2SB (sbrust): arch field (GMod jit.arch values: x86/x64/arm/arm64) --
+    // util.IsBinaryModuleInstalled derives the suffix from it; 32/64-bit no longer share one slot.
 #if defined( __aarch64__ ) || defined( _M_ARM64 ) || defined( _M_ARM64EC )
     "jit = jit or { version = 'Lua 5.4 (no LuaJIT)', version_num = 50400, arch = 'arm64' }\n"
 #elif defined( _WIN64 ) || defined( __x86_64__ )
@@ -2322,56 +2344,33 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
     "player = player or {}\n"
     "LoadPresets = LoadPresets or function() end\n"
     "SENSORBONE = SENSORBONE or {}\n"
-    //---------------------------------------------------------------------
-    // sql: GMod's sql library is SQLite-backed and this engine ships no
-    // sqlite3 at all (no sqlite3.h/.c anywhere; the only sql code is the
-    // MySQL developer tools under utils/, which are not in client.dll or
-    // server.dll).  luasrclib.h declares no sql library either, so there is
-    // nothing to bind.
-    //
-    // This is a STUB, not an implementation.  It keeps GMod's shapes so the
-    // three imported files that merely CALL it can load --
-    //
-    //     modules/cookie.lua:2            attempt to index a nil value (global sql)
-    //     extensions/player.lua:37        ... (global sql)
-    //     extensions/entity_iter.lua:14   (cascade: player.lua never ran)
-    //
-    // Queries return empty results and LastError says so, instead of
-    // pretending to persist.  Replacing this with sqlite3 is a build-level
-    // job (vendor the amalgamation + register the library in lsrcinit.cpp),
-    // not a Lua one.
-    //---------------------------------------------------------------------
-    "sql = sql or {\n"
-    "  IsStub = true,\n"
-    "  LastError = function() return 'sqlite is not available in this engine; nothing is persisted' end,\n"
-    "  SQLStr = function( str, bNoQuotes )\n"
-    "    local s = tostring( str ):gsub( \"'\", \"''\" )\n"
-    "    if ( bNoQuotes ) then return s end\n"
-    "    return \"'\" .. s .. \"'\"\n"
-    "  end,\n"
-    "  TableExists = function() return false end,\n"
-    "  Query = function( q )\n"
-    "    if ( !sql._warned ) then\n"
-    "      sql._warned = true\n"
-    "      Msg( \"[HL2SB] sql is a STUB: this engine ships no sqlite3 (see lsrcinit.cpp), so nothing written through sql is persisted and every read comes back empty.\\n\" )\n"
-    "      Msg( \"[HL2SB]   first statement swallowed: \" .. tostring( q ) .. \"\\n\" )\n"
-    "    end\n"
-    "    return {}\n"
-    "  end,\n"
-    "  QueryRow = function() return nil end,\n"
-    "  QueryValue = function() return nil end,\n"
-    "  Begin = function() end,\n"
-    "  Commit = function() end,\n"
-    "}\n" ) == 0 )
+    // sql used to be a dostring stub here (IsStub, swallow-everything Query).
+    // It is the real SQLite-backed library now: C side registered above in
+    // luasrclibs (lsql.cpp).  The stub block is gone; the Lua shell is
+    // attached right below.
+    ) == 0 )
   {
     lua_pcall( L, 0, 0, 0 );
   }
   else
   {
     // A syntax error here is a bug in this snippet, not in the game.
-    Warning( "[HL2SB] lsrcinit: GMod global stubs failed to compile: %s\n", lua_tostring( L, -1 ) );
+    luasrc_LuaWarnMsgF( "[HL2SB] lsrcinit: GMod global stubs failed to compile: %s\n", lua_tostring( L, -1 ) );
     lua_pop( L, 1 );
   }
+
+  //-----------------------------------------------------------------------------
+  // HL2SB: attach GMod's Lua shell for the sql library right here, at
+  // openlibs time.  Both realms run the extensions and modules folder passes
+  // BEFORE lua/includes/init.lua, and those passes consume sql.TableExists
+  // at load time (extensions/player.lua playerpdata, modules/cookie.lua) --
+  // so SQLStr / TableExists / IndexExists / QueryRow / QueryValue / Begin /
+  // Commit / LastError / the global SQLStr must exist here, not at
+  // init.lua time.  The old stub lived in this exact spot for the same
+  // reason.  init.lua still does include( "util/sql.lua" ) later, which just
+  // re-runs the file (it only redefines the same functions).
+  //-----------------------------------------------------------------------------
+  luasrc_dofile_includes( L, "util/sql.lua" );
 
   //-----------------------------------------------------------------------------
   // HL2SB: GMod's `game` table.
@@ -2407,7 +2406,7 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
     lua_pushcfunction( L, lua_game_GetMap );       lua_setfield( L, -2, "GetMap" );
     lua_pushcfunction( L, lua_game_SinglePlayer ); lua_setfield( L, -2, "SinglePlayer" );
     lua_pushcfunction( L, lua_game_IsDedicated );  lua_setfield( L, -2, "IsDedicated" );
-    lua_pushcfunction( L, lua_game_GetAmmoName );  lua_setfield( L, -2, "GetAmmoName" );  // ← 新增
+    lua_pushcfunction( L, lua_game_GetAmmoName );  lua_setfield( L, -2, "GetAmmoName" );
   }
   lua_pop( L, 1 );
 
@@ -2435,10 +2434,21 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
 #ifndef STUDIO_DRAWTRANSLUCENTSUBMODELS
 #define STUDIO_DRAWTRANSLUCENTSUBMODELS 0x00000004
 #endif
+// HL2SB (2026-10-03): the shadow/depth draw flags that reference addons test
+// inside RenderOverride (First Person Body gates its projected-shadow copies
+// with bit.band on these); values from public/model_types.h:31,34.
+#ifndef STUDIO_SSAODEPTHTEXTURE
+#define STUDIO_SSAODEPTHTEXTURE 0x08000000
+#endif
+#ifndef STUDIO_SHADOWDEPTHTEXTURE
+#define STUDIO_SHADOWDEPTHTEXTURE 0x40000000
+#endif
 
   lua_pushinteger( L, STUDIO_RENDER );                   lua_setglobal( L, "STUDIO_RENDER" );
   lua_pushinteger( L, STUDIO_VIEWXFORMATTACHMENTS );     lua_setglobal( L, "STUDIO_VIEWXFORMATTACHMENTS" );
   lua_pushinteger( L, STUDIO_DRAWTRANSLUCENTSUBMODELS ); lua_setglobal( L, "STUDIO_DRAWTRANSLUCENTSUBMODELS" );
+  lua_pushinteger( L, STUDIO_SSAODEPTHTEXTURE );         lua_setglobal( L, "STUDIO_SSAODEPTHTEXTURE" );
+  lua_pushinteger( L, STUDIO_SHADOWDEPTHTEXTURE );       lua_setglobal( L, "STUDIO_SHADOWDEPTHTEXTURE" );
 
   luaL_register(L, "_G", lua_metatable_funcs);
   lua_pop(L, 1);
@@ -2510,7 +2520,7 @@ LUALIB_API void luasrc_openlibs (lua_State *L) {
   }
   else
   {
-    Warning( "[HL2SB] lsrcinit: achievements stub failed to compile: %s\n", lua_tostring( L, -1 ) );
+    luasrc_LuaWarnMsgF( "[HL2SB] lsrcinit: achievements stub failed to compile: %s\n", lua_tostring( L, -1 ) );
     lua_pop( L, 1 );
   }
 

@@ -7,6 +7,8 @@
 #include "materialsystem/imaterial.h"
 #include "materialsystem/imaterialvar.h"
 #include "filesystem.h"
+#include "tier1/utlmap.h"
+#include "hl2sb_framestats_cat.h"
 #ifdef CLIENT_DLL
 #include "rendertexture.h"
 #include "view_scene.h"
@@ -362,6 +364,12 @@ struct HL2SB_ImageColorCache_t
 
 static CUtlVector< HL2SB_ImageColorCache_t * > s_ImageColorCache;
 
+// s_ImageColorCache is a bare CUtlVector and stb_image keeps its failure state
+// in a file-scope global, so the miss path (append + decode) has to be
+// serialised - a second thread would otherwise push a duplicate entry and the
+// two decodes would scribble over each other (issue #41, 7.4).
+static CThreadFastMutex s_ImageColorCacheMutex;
+
 static const char *s_pImageTextureExtensions[] = { ".png", ".jpg", ".jpeg", ".tga", ".bmp" };
 
 // HL2SB: case-insensitive "does pName end with pExt".
@@ -391,6 +399,8 @@ static HL2SB_ImageColorCache_t *HL2SB_GetImageColorCache( const char *pTextureNa
 {
     if ( !pTextureName || !pTextureName[0] )
         return NULL;
+
+    AUTO_LOCK( s_ImageColorCacheMutex );
 
     HL2SB_ImageColorCache_t *pCached = HL2SB_FindCachedImage( pTextureName );
     if ( pCached )
@@ -459,23 +469,33 @@ static HL2SB_ImageColorCache_t *HL2SB_GetImageColorCache( const char *pTextureNa
 ** file is remembered too, so Material() falls through to FindMaterial (error
 ** material, same as GMod) without re-probing.
 */
-struct HL2SB_ImageMaterial_t
+// HL2SB (2026-10-03): the cache was a CUtlVector scanned with one Q_stricmp
+// per entry, so every Material() hit was O(entries) and an addon painting
+// ~40 image textures ~300x per frame walked thousands of string compares per
+// frame.  A name-ordered map turns the hit path into O(log entries) - one
+// binary-search compare against the name - with no behaviour change.
+static bool HL2SB_ImageMaterialLess( const char * const &pszLhs, const char * const &pszRhs )
 {
-    char m_szName[MAX_PATH];
-    IMaterial *m_pMaterial;
-};
+    return Q_stricmp( pszLhs, pszRhs ) < 0;
+}
 
-static CUtlVector< HL2SB_ImageMaterial_t > s_ImageMaterials;
+// Key strings are heap-owned by the map (strdup at insert) and live for the
+// process lifetime, matching the old per-entry MAX_PATH copies.
+static CUtlMap< const char *, IMaterial * > s_ImageMaterials( HL2SB_ImageMaterialLess );
+
+// s_ImageMaterials is shared state; two Material("x.png") calls from
+// different threads would race the insert against the Find above.
+static CThreadFastMutex s_ImageMaterialsMutex;
 
 // Returns NULL when pMaterialName is not a loadable image file.  pMaterialName
 // must carry the extension ("nyan/cat.png"), which is GMod's documented form.
 static IMaterial *HL2SB_FindOrCreateImageMaterial( const char *pMaterialName )
 {
-    for ( int i = 0; i < s_ImageMaterials.Count(); ++i )
-    {
-        if ( !Q_stricmp( s_ImageMaterials[i].m_szName, pMaterialName ) )
-            return s_ImageMaterials[i].m_pMaterial;
-    }
+    AUTO_LOCK( s_ImageMaterialsMutex );
+
+    int iFound = s_ImageMaterials.Find( pMaterialName );
+    if ( iFound != s_ImageMaterials.InvalidIndex() )
+        return s_ImageMaterials[iFound];
 
     IMaterial *pMaterial = NULL;
 
@@ -509,9 +529,7 @@ static IMaterial *HL2SB_FindOrCreateImageMaterial( const char *pMaterialName )
         }
     }
 
-    HL2SB_ImageMaterial_t &entry = s_ImageMaterials[s_ImageMaterials.AddToTail()];
-    Q_strncpy( entry.m_szName, pMaterialName, sizeof( entry.m_szName ) );
-    entry.m_pMaterial = pMaterial;
+    s_ImageMaterials.Insert( strdup( pMaterialName ), pMaterial );
 
     return pMaterial;
 }
@@ -671,6 +689,7 @@ static int HL2SB_Material( lua_State *L )
 
     if ( bImageName )
     {
+        HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_MATERIAL_IMG );
         IMaterial *pImageMaterial = HL2SB_FindOrCreateImageMaterial( pMaterialName );
         if ( pImageMaterial )
         {
@@ -681,6 +700,7 @@ static int HL2SB_Material( lua_State *L )
         // material -- which is what GMod hands out for a missing image too.
     }
 
+    HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_MATERIAL_VMT );
     IMaterial *pMaterial = materials->FindMaterial( pMaterialName, TEXTURE_GROUP_VGUI, false );
 
     if ( !pMaterial )

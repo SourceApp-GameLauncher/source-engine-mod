@@ -260,13 +260,59 @@ LUA_BINDING_BEGIN( Renders, GetScreenEffectTexture, "library", "Get the screen e
     // this arrangement: halo captures with UpdateScreenEffectTexture BEFORE
     // drawing any silhouette, so the FB holds the pre-halo scene and is only
     // sampled after the pass.
-    int nIndex = (int)LUA_BINDING_ARGUMENT( luaL_checknumber, 1, "textureIndex" );
+    int nIndex = (int)LUA_BINDING_ARGUMENT_WITH_DEFAULT( luaL_optnumber, 1, 0, "textureIndex" );
     nIndex = clamp( nIndex, 0, 1 );
     lua_pushitexture( L, GetFullFrameFrameBufferTexture( nIndex ) );
     return 1;
 }
 LUA_BINDING_END( "Texture", "The screen effect texture." )
 
+// HL2SB (2026-10-02) GMod compat: render.GetMoBlurTex0() -- the motion-blur
+// accumulation target lua/postprocess/motion_blur.lua draws with.  GMod's
+// client lazily creates a named 256x256 render target ("s_pMoBlurTex0") on
+// first use; do the same through the same creation call the spawnicon
+// snapshot helper uses, so repeated calls return the same texture.
+// HL2SB (2026-10-02, second pass): the creation must sit inside a render
+// target allocation window -- CMaterialSystem refuses named RT creation
+// outside one (Warning + NULL every call), which meant a per-frame failed
+// attempt + warning once DrawMotionBlur ran from the HUD (213 warnings in
+// one session).  Wrap the one-shot creation in the public allocation APIs.
+LUA_BINDING_BEGIN( Renders, GetMoBlurTex0, "library", "Get the motion blur render target texture.", "client" )
+{
+    static ITexture *s_pMoBlurTex0 = NULL;
+    if ( s_pMoBlurTex0 == NULL )
+    {
+        materials->BeginRenderTargetAllocation();
+        s_pMoBlurTex0 = materials->CreateNamedRenderTargetTextureEx2(
+            "s_pMoBlurTex0", 256, 256, RT_SIZE_LITERAL, IMAGE_FORMAT_RGBA8888,
+            MATERIAL_RT_DEPTH_SEPARATE,
+            TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_NOMIP | TEXTUREFLAGS_NOLOD,
+            0 );
+        materials->EndRenderTargetAllocation();
+        if ( s_pMoBlurTex0 == NULL )
+        {
+            lua_pushnil( L );
+            return 1;
+        }
+    }
+    lua_pushitexture( L, s_pMoBlurTex0 );
+    return 1;
+}
+LUA_BINDING_END( "Texture", "The motion blur texture." )
+
+LUA_BINDING_BEGIN( Renders, EnableClipping, "library", "Enable or disable clipping, returns the previous state.", "client" )
+{
+    CMatRenderContextPtr pRenderContext( materials );
+    // Reference behaviour: the engine's EnableClipping returns
+    // the PREVIOUS clipping state and that value is pushed -- First Person
+    // Body saves it around its clip plane and restores it afterwards.
+    bool bPrevious = pRenderContext->EnableClipping( LUA_BINDING_ARGUMENT( lua_toboolean, 1, "isEnabled" ) );
+    lua_pushboolean( L, bPrevious );
+    return 1;
+}
+LUA_BINDING_END( "boolean", "The previous clipping state." )
+
+// Legacy alias kept for content that predates the GMod name.
 LUA_BINDING_BEGIN( Renders, SetClippingEnabled, "library", "Set the clipping enabled.", "client" )
 {
     CMatRenderContextPtr pRenderContext( materials );
@@ -274,6 +320,27 @@ LUA_BINDING_BEGIN( Renders, SetClippingEnabled, "library", "Set the clipping ena
     return 0;
 }
 LUA_BINDING_END()
+
+LUA_BINDING_BEGIN( Renders, GetColorModulation, "library", "Get the color modulation.", "client" )
+{
+    float flColor[3] = { 1.0f, 1.0f, 1.0f };
+
+    // IVRenderView carries the modulation query (IMatRenderContext in this
+    // fork does not expose a getter).
+    render->GetColorModulation( flColor );
+    lua_pushnumber( L, flColor[0] );
+    lua_pushnumber( L, flColor[1] );
+    lua_pushnumber( L, flColor[2] );
+    return 3;
+}
+LUA_BINDING_END( "number, number, number", "The r, g, b modulation." )
+
+LUA_BINDING_BEGIN( Renders, GetBlend, "library", "Get the alpha blend.", "client" )
+{
+    lua_pushnumber( L, render->GetBlend() );
+    return 1;
+}
+LUA_BINDING_END( "number", "The alpha blend." )
 
 LUA_BINDING_BEGIN( Renders, UpdateScreenEffectTexture, "library", "Update the screen effect texture.", "client" )
 {
@@ -788,9 +855,16 @@ static int cam_End (lua_State *L) {
   return 0;
 }
 
-// cam.IgnoreZ( ignore ) -- this branch's IMatRenderContext has no SetIgnoreZ;
-// accepted and no-op'd (halo.lua defaults ignorez=false anyway).
+// cam.IgnoreZ( ignore ) -- depth override for subsequent 2D/3D2D draws.
+// Reference behavior (GMod): the context's depth range is clamped to
+// (0, 0.01) while ignored -- everything drawn afterwards maps to the near
+// plane, so already-rendered geometry cannot occlude it -- and restored to
+// (0, 1) when the override is lifted.
 static int cam_IgnoreZ (lua_State *L) {
+  bool bIgnore = lua_toboolean( L, 1 ) != 0;
+
+  CMatRenderContextPtr pRenderContext( materials );
+  pRenderContext->DepthRange( 0.0f, bIgnore ? 0.01f : 1.0f );
   return 0;
 }
 
@@ -809,21 +883,22 @@ static int cam_Start3D2D (lua_State *L) {
 	if ( !g_pMatSystemSurface )
 		return 0;
 
+	// Reference matrix, bit for bit: AngleMatrix( angles, pos ) multiplied by
+	// diag( scale, -scale, 1 ).  The product's COLUMNS carry the scale, so the
+	// translation column survives untouched and the 2D origin lands exactly
+	// at pos.  The previous implementation scaled ROWS, which dragged the
+	// translation along (pos became (pos.x*scale, -pos.y*scale, pos.z)) and
+	// planted the plane at world coordinates unrelated to the caller's --
+	// every draw executed without an error and nothing was ever on screen.
+	// The negative y mirrors vgui's downward text axis onto the plane.
 	matrix3x4_t mat;
 	AngleMatrix( ang, pos, mat );
-	VMatrix vm( mat );
+	VMatrix vmAngle( mat );
+	VMatrix vmScale;
+	MatrixBuildScale( vmScale, scale, -scale, 1.0f );
 
-	// HL2SB GMod compat (2026-09-25): exact wiki formula - SetAngles,
-	// SetTranslation, SetScale( Vector( scale, -scale, 1 ) ).  Rows of the
-	// AngleMatrix are the world-space basis (row0 = forward = 2D +x,
-	// row1 = -right = 2D +y), so SetScale scales ROWS: x by +scale, y by
-	// -scale (flips vgui's downward y), z (out of the plane) left at 1.
-	// The old uniform scale mirrored the text and broke the winding.
-	for ( int c = 0; c < 4; c++ )
-	{
-		vm.m[0][c] *= scale;
-		vm.m[1][c] *= -scale;
-	}
+	VMatrix vm;
+	MatrixMultiply( vmAngle, vmScale, vm );
 
 	g_pMatSystemSurface->PushModelMatrix( vm );
 	CMatRenderContextPtr pRenderContext( materials );

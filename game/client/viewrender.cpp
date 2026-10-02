@@ -7,6 +7,7 @@
 #include "cbase.h"
 #include "view.h"
 #include "luamanager.h"	// HL2SB GMod compat: PostDrawEffects per-frame hook
+#include "hl2sb_framestats.h"	// HL2SB: hl2sb_framestats per-second frame profile
 #include "lbaseentity_shared.h"	// HL2SB GMod compat: lua_pushentity
 #include "mathlib/lvector.h"	// HL2SB GMod compat: lua_pushvector/lua_pushangle (RenderScene)
 #include "lbaseplayer_shared.h"	// HL2SB GMod compat: lua_pushplayer
@@ -2217,6 +2218,31 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
 
 		CleanupMain3DView( view );
 
+		// HL2SB GMod compat: fire GM:RenderScreenspaceEffects once per frame,
+		// after the 3D scene and its screen-space effects and before the HUD --
+		// GMod's postprocessing stage.  This is where GMod's own
+		// lua/postprocess/*.lua effects (pp_colormod, pp_motionblur, ...) and
+		// every addon's hook.Add("RenderScreenspaceEffects", ...) run; without
+		// a dispatcher those hooks were registered but never called.  Must come
+		// BEFORE the PostDrawEffects pump below (GMod order: RSE, then
+		// PostDrawEffects).  Same in-game guard as PostDrawEffects.
+		{
+			extern bool g_bRenderingReflection;
+			if ( L != NULL && !g_bRenderingReflection && engine->IsInGame() )
+			{
+				// HL2SB: measured only while hl2sb_framestats is on - the off
+				// path pays nothing beyond the existing dispatch.
+				bool bFrameStats = HL2SB_FrameStats_Enabled();
+				double flHookStart = 0.0;
+				if ( bFrameStats )
+					flHookStart = Plat_FloatTime();
+				BEGIN_LUA_CALL_HOOK( "RenderScreenspaceEffects" );
+				END_LUA_CALL_HOOK( 0, 0 );
+				if ( bFrameStats )
+					HL2SB_FrameStats_NoteLuaHook( "RenderScreenspaceEffects", Plat_FloatTime() - flHookStart );
+			}
+		}
+
 		// HL2SB GMod compat: fire GM:PostDrawEffects once per frame, after the
 		// 3D scene (world/entities/viewmodel) and screen-space effects, before
 		// the HUD.  This is the hook GMod's own modules/halo.lua renders on
@@ -2228,8 +2254,14 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
 			extern bool g_bRenderingReflection;
 			if ( L != NULL && !g_bRenderingReflection && engine->IsInGame() )
 			{
+				bool bFrameStats = HL2SB_FrameStats_Enabled();
+				double flHookStart = 0.0;
+				if ( bFrameStats )
+					flHookStart = Plat_FloatTime();
 				BEGIN_LUA_CALL_HOOK( "PostDrawEffects" );
 				END_LUA_CALL_HOOK( 0, 0 );
+				if ( bFrameStats )
+					HL2SB_FrameStats_NoteLuaHook( "PostDrawEffects", Plat_FloatTime() - flHookStart );
 			}
 		}
 
@@ -2422,8 +2454,21 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
 		// GMod fires it every frame while the 2D HUD context is up, so addons
 		// drawing debug overlays/meters via hook.Add("HUDPaint", ...) show up.
 		// Runs after the stock HUD elements, still inside Push2DView.
+		// HL2SB (2026-10-03): this pump is also the once-per-main-view-frame
+		// anchor for hl2sb_framestats - frame intervals are measured between
+		// consecutive runs of this block (a monitor view re-running it shows
+		// up as extra short intervals in the average, by design).
+		bool bFrameStats = HL2SB_FrameStats_Enabled();
+		double flHookStart = 0.0;
+		if ( bFrameStats )
+		{
+			HL2SB_FrameStats_FramePulse();
+			flHookStart = Plat_FloatTime();
+		}
 		BEGIN_LUA_CALL_HOOK( "HUDPaint" );
 		END_LUA_CALL_HOOK( 0, 0 );
+		if ( bFrameStats )
+			HL2SB_FrameStats_NoteLuaHook( "HUDPaint", Plat_FloatTime() - flHookStart );
 #endif
 
 		// maybe paint the main menu and cursor too if we're in stereo hud mode

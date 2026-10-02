@@ -20,6 +20,8 @@
 #include "lua/materialsystem/limaterial.h"
 #include "vgui/IInput.h"
 #include "ienginevgui.h"
+#include "hl2sb_framestats.h"	// HL2SB: hl2sb_framestats surface draw counter
+#include "hl2sb_framestats_cat.h"	// HL2SB: per-category wall-time buckets
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -287,11 +289,14 @@ static int surface_CreatePopup (lua_State *L) {
 }
 
 static int surface_DrawFilledRect (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_RECT );
   surface()->DrawFilledRect(luaL_checkint(L, 1), luaL_checkint(L, 2), luaL_checkint(L, 3), luaL_checkint(L, 4));
   return 0;
 }
 
 static int surface_DrawFilledRectFade (lua_State *L) {
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_RECT );
   surface()->DrawFilledRectFade(luaL_checkint(L, 1), luaL_checkint(L, 2), luaL_checkint(L, 3), luaL_checkint(L, 4), luaL_checkint(L, 5), luaL_checkint(L, 6), luaL_checkboolean(L, 7));
   return 0;
 }
@@ -345,11 +350,15 @@ static int surface_DrawOutlinedCircle (lua_State *L) {
 }
 
 static int surface_DrawOutlinedRect (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_RECT );
   surface()->DrawOutlinedRect(luaL_checkint(L, 1), luaL_checkint(L, 2), luaL_checkint(L, 3), luaL_checkint(L, 4));
   return 0;
 }
 
 static int surface_DrawPrintText (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_TEXTPRINT );
   const char *sz = luaL_checkstring(L, 1);
   int bufSize = (strlen( sz ) + 1 ) * sizeof(wchar_t);
   wchar_t *wbuf = static_cast<wchar_t *>( _alloca( bufSize ) );
@@ -377,6 +386,7 @@ static int surface_DrawSetTextColor (lua_State *L) {
 }
 
 static int surface_DrawSetTextFont (lua_State *L) {
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_SETFONT );
   surface()->DrawSetTextFont(luaL_checkfont(L, 1));
   return 0;
 }
@@ -413,12 +423,55 @@ static int surface_DrawSetTexture (lua_State *L) {
 // build faults.  The fallback below only covers "library open did not run".
 static int s_nMaterialDrawTextureID = -1;
 
-static int surface_SetMaterial (lua_State *L) {
-  int &nMaterialDrawTextureID = s_nMaterialDrawTextureID;
+// HL2SB (2026-10-03): DrawSetTextureFile resolves its name through the
+// texture system (path search + dictionary) on EVERY call -- measured at
+// ~2.3ms per call on the ARM64-emulated test machine, with tarkov_hud
+// calling SetMaterial ~33x per frame (950ms/s, the single largest cost of
+// the whole session).  A material's texture-file resolution result never
+// changes, so the resolution runs ONCE per material name and the bound
+// texture id is cached; every later SetMaterial for the same material pays
+// only the cheap DrawSetTexture.  The one shared s_nMaterialDrawTextureID
+// stays for the uncached fallback path.
+struct HL2SB_MaterialTextureCacheEntry_t
+{
+	char m_szName[ 128 ];
+	int  m_nTextureID;
+};
+static CUtlVector< HL2SB_MaterialTextureCacheEntry_t > s_MaterialTextureCache;
 
-  if ( nMaterialDrawTextureID == -1 ) {
-    nMaterialDrawTextureID = surface()->CreateNewTextureID();
-  }
+static int HL2SB_CachedMaterialTexture( IMaterial *pMaterial )
+{
+	const char *pName = pMaterial->GetName();
+
+	FOR_EACH_VEC( s_MaterialTextureCache, i )
+	{
+		if ( Q_stricmp( s_MaterialTextureCache[ i ].m_szName, pName ) == 0 )
+			return s_MaterialTextureCache[ i ].m_nTextureID;
+	}
+
+	if ( s_MaterialTextureCache.Count() >= 256 )
+	{
+		// Pathological material count: fall back to the original per-call
+		// resolve on the shared id rather than skipping the bind.
+		if ( s_nMaterialDrawTextureID == -1 )
+			s_nMaterialDrawTextureID = surface()->CreateNewTextureID();
+		surface()->DrawSetTextureFile( s_nMaterialDrawTextureID, pName, true, false );
+		return s_nMaterialDrawTextureID;
+	}
+
+	// Each cached material binds its OWN texture id: sharing one id would let
+	// the next DrawSetTextureFile overwrite the previous material's binding.
+	int nTextureID = surface()->CreateNewTextureID();
+	surface()->DrawSetTextureFile( nTextureID, pName, true, false );
+
+	HL2SB_MaterialTextureCacheEntry_t &entry = s_MaterialTextureCache[ s_MaterialTextureCache.AddToTail() ];
+	Q_strncpy( entry.m_szName, pName, sizeof( entry.m_szName ) );
+	entry.m_nTextureID = nTextureID;
+	return nTextureID;
+}
+
+static int surface_SetMaterial (lua_State *L) {
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_SETMATERIAL );
 
   IMaterial *pMaterial = luaL_checkmaterial(L, 1);
 
@@ -427,8 +480,12 @@ static int surface_SetMaterial (lua_State *L) {
   // this fork (the deployed vgui2/MatSystemSurface is an older interface version,
   // so the virtual slot does not match) -- verified with a minidump.  Bind by
   // name instead: DrawSetTextureFile resolves the material through FindMaterial
-  // and hands that very material to the dictionary slot.
-  surface()->DrawSetTextureFile( nMaterialDrawTextureID, pMaterial->GetName(), true, false );
+  // and hands that very material to the dictionary slot.  The resolution is
+  // cached per material name (see HL2SB_CachedMaterialTexture above).
+  int nMaterialDrawTextureID = HL2SB_CachedMaterialTexture( pMaterial );
+  if ( nMaterialDrawTextureID == -1 )
+    return 0;
+
   surface()->DrawSetTexture( nMaterialDrawTextureID );
   return 0;
 }
@@ -536,11 +593,15 @@ static int surface_DrawSetTextureFile (lua_State *L) {
 }
 
 static int surface_DrawTexturedRect (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_TEXRECT );
   surface()->DrawTexturedRect(luaL_checkint(L, 1), luaL_checkint(L, 2), luaL_checkint(L, 3), luaL_checkint(L, 4));
   return 0;
 }
 
 static int surface_DrawTexturedSubRect (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_TEXRECT );
   surface()->DrawTexturedSubRect(luaL_checkint(L, 1), luaL_checkint(L, 2), luaL_checkint(L, 3), luaL_checkint(L, 4), luaL_checknumber(L, 5), luaL_checknumber(L, 6), luaL_checknumber(L, 7), luaL_checknumber(L, 8));
   return 0;
 }
@@ -555,6 +616,8 @@ static int surface_DrawTexturedSubRect (lua_State *L) {
 // argument-shape translation.  draw.RoundedBox() builds its corners with it.
 // ---------------------------------------------------------------------------
 static int surface_DrawTexturedRectUV (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_TEXRECT );
   int x = luaL_checkint(L, 1);
   int y = luaL_checkint(L, 2);
   int w = luaL_checkint(L, 3);
@@ -588,6 +651,8 @@ static int surface_DrawTexturedRectUV (lua_State *L) {
 // fonts, which live in a shared page and are never drawn through this path.
 // ---------------------------------------------------------------------------
 static int surface_DrawTexturedRectRotated (lua_State *L) {
+  HL2SB_FrameStats_AddSurfaceDraw();
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_TEXRECT );
   const float flX  = (float)luaL_checknumber(L, 1);
   const float flY  = (float)luaL_checknumber(L, 2);
   const float flW  = (float)luaL_checknumber(L, 3);
@@ -725,6 +790,7 @@ static int surface_GetScreenSize (lua_State *L) {
 // here; GetTextSize falls back to it for the single-argument form.
 static HFont s_hLastSetTextFont = 0;
 static int surface_GetTextSize (lua_State *L) {
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_TEXTMEASURE );
   // HL2SB GMod compat (2026-09-25): wiki - surface.GetTextSize( text )
   // measures with the font last set by surface.SetFont.  The older
   // Experiment:Source spelling GetTextSize( font, text ) still works.
@@ -904,6 +970,7 @@ static int surface_SetBitmapFontName (lua_State *L) {
 // scheme's "Default" font when the name is unknown (HL2SB's clientscheme only
 // defines Default / DefaultSmall / DefaultVerySmall).
 static int surface_SetFont (lua_State *L) {
+  HL2SB_FrameStatsCatScope fcScope( HL2SB_FCAT_SURF_SETFONT );
   const char *szName = luaL_checkstring(L, 1);
 
   // HL2SB: the shared resolver (LuaFont_ResolveByName above) -- registry first
