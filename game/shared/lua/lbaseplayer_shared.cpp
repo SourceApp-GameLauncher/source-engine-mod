@@ -936,6 +936,33 @@ static int CBasePlayer_Crouching (lua_State *L) {
   return 1;
 }
 
+// HL2SB (2026-10-02) GMod compat: Player:IsSprinting().
+//
+// tarkovhud.lua:768 (the shipped EFT HUD) called ply:IsSprinting() inside
+// HUDPaint and threw "attempt to call a nil value (method 'IsSprinting')"
+// every frame -- the same class of gap the earlier Player:Armor() fix closed.
+//
+// HL2/Source has no native sprint concept; the GMod/sandbox mapping is:
+//   - IN_SPEED held          = walking
+//   - IN_SPEED released + any move key held = running (what GMod calls
+//     "sprinting" -- sandbox only needs that to drive its noise icon)
+//   - no move key held       = idle, not sprinting
+//
+// tarkovhud only feeds this into Walkdetect for the noise indicator, so the
+// button-state reading is exact enough -- no speed threshold needed (which
+// would also misfire for a player pressed against a wall while running).
+static int CBasePlayer_IsSprinting (lua_State *L) {
+  CBasePlayer *pPlayer = luaL_checkplayer(L, 1);
+
+  const int nButtons = pPlayer->m_nButtons;
+  const int nMoveKeys = ( IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT );
+
+  lua_pushboolean( L,
+    ( nButtons & nMoveKeys ) != 0 &&
+    ( nButtons & IN_SPEED ) == 0 );
+  return 1;
+}
+
 // HL2SB (2026-09-22): Player:DoAnimationEvent( event, data ).  GMod routes the
 // event through the gamemode; the SWEP bases this fork must run (cf_beast)
 // pass the engine's own PLAYER_ANIM value (PLAYER_ATTACK1) expecting the third
@@ -2360,6 +2387,8 @@ static const luaL_Reg CBasePlayermeta[] = {
   {"SetAnimationExtension", CBasePlayer_SetAnimationExtension},
   // HL2SB (2026-09-22): GMod names -- cf_beast's weapon base calls both.
   {"Crouching", CBasePlayer_Crouching},
+  // HL2SB GMod compat: Player:IsSprinting() -- tarkovhud.lua:768 needs it.
+  {"IsSprinting", CBasePlayer_IsSprinting},
   {"DoAnimationEvent", CBasePlayer_DoAnimationEvent},
   {"SetBloodColor", CBasePlayer_SetBloodColor},
   {"SetFOV", CBasePlayer_SetFOV},
