@@ -148,58 +148,46 @@ LUA_BINDING_BEGIN( Renders, CreateNamedRenderTarget, "library", "Creates or find
 }
 LUA_BINDING_END( "Texture", "The render target texture." )
 
+// render.SetFrameBufferCopyTexture( texture, slot ) -- HL2SB (2026-10-03).
+// Registers a texture into the frame-buffer-copy slot that "$basetexture
+// _rt_FullFrameFB[N]" materials resolve through AT BIND TIME
+// (BindStandardTexture case TEXTURE_FRAME_BUFFER_FULL_TEXTURE_N reads
+// m_pCurrentFrameBufferCopyTexture[N]; an unregistered slot binds nothing).
+// The reference engine binds these materials directly, but engine code that
+// re-registers a slot mid-frame silently redirects every later quad sampling
+// the screen copy: view_scene.h UpdateRefractTexture puts the power-of-two
+// FB into slot 0, so the halo restore/composite read the post-clear BLACK
+// POT copy instead of the captured scene.  The halo module re-asserts its
+// registrations after each such call.
+LUA_BINDING_BEGIN( Renders, SetFrameBufferCopyTexture, "library", "Registers a texture into a frame-buffer-copy slot.", "client" )
+{
+    ITexture *pTexture = LUA_BINDING_ARGUMENT( luaL_checkitexture, 1, "texture" );
+    int nIndex = (int)LUA_BINDING_ARGUMENT_WITH_DEFAULT( luaL_optnumber, 2, 0, "textureIndex" );
+
+    CMatRenderContextPtr pRenderContext( materials );
+    pRenderContext->SetFrameBufferCopyTexture( pTexture, nIndex );
+
+    return 0;
+}
+LUA_BINDING_END()
+
 LUA_BINDING_BEGIN( Renders, CopyRenderTargetToTexture, "library", "Copies the currently active Render Target to the specified texture.", "client" )
 {
     CMatRenderContextPtr pRenderContext( materials );
     ITexture *pTexture = LUA_BINDING_ARGUMENT( luaL_checkitexture, 1, "texture" );
 
-    // HL2SB (2026-09-26): GMod parity, implemented as the ENGINE'S OWN
-    // UpdateScreenEffectTexture inline (view_scene.h) minus the FB lookup --
-    // that is the copy path the working halo capture always used.  The src
-    // rect comes from GetRenderTargetDimensions (the LIVE render-target
-    // size), NOT GetViewport (stale/wrong at PostDrawEffects -- a small src
-    // rect StretchRects a corner of garbage into the copy, which blacked the
-    // scene-restore step), and the dest rect is scaled like the inline when
-    // the texture differs in size.
-    int nSrcW, nSrcH;
-    pRenderContext->GetRenderTargetDimensions( nSrcW, nSrcH );
-    int nDstW = pTexture->GetActualWidth();
-    int nDstH = pTexture->GetActualHeight();
+    // HL2SB (2026-10-03): reference behaviour, decompiled -- the binding is
+    // the plain ONE-ARG engine call.  Source = the CURRENT render target
+    // (the backbuffer at PostDrawEffects), source and dest rects NULL =
+    // full-surface copy (the SDK body resolves to
+    // CopyRenderTargetToTextureEx( pTexture, 0, NULL, NULL ) ->
+    // ITextureInternal::CopyFrameBufferToMe( 0, NULL, NULL )).  No rect
+    // math, no SetFrameBufferCopyTexture registration -- the reference
+    // samples the stored texture through a plain $basetexture, which never
+    // consults the frame-buffer-copy slot.  The earlier custom rect-scaling
+    // implementation diverged from this and is gone.
 
-    Rect_t srcRect;
-    srcRect.x = 0;
-    srcRect.y = 0;
-    srcRect.width = nSrcW;
-    srcRect.height = nSrcH;
-
-    Rect_t destRect = srcRect;
-    if ( nSrcW > nDstW || nSrcH > nDstH )
-    {
-        float scaleX = ( float )nDstW / ( float )nSrcW;
-        float scaleY = ( float )nDstH / ( float )nSrcH;
-        destRect.x = ( int )( srcRect.x * scaleX );
-        destRect.y = ( int )( srcRect.y * scaleY );
-        destRect.width = ( int )( srcRect.width * scaleX );
-        destRect.height = ( int )( srcRect.height * scaleY );
-        destRect.x = clamp( destRect.x, 0, nDstW );
-        destRect.y = clamp( destRect.y, 0, nDstH );
-        destRect.width = clamp( destRect.width, 0, nDstW - destRect.x );
-        destRect.height = clamp( destRect.height, 0, nDstH - destRect.y );
-    }
-
-    pRenderContext->CopyRenderTargetToTextureEx( pTexture, 0, &srcRect, &destRect );
-
-    // HL2SB (2026-09-26): GMod-parity registration -- same slots the engine
-    // inline registers (the frame-buffer pair handed out by
-    // render.GetScreenEffectTexture).
-    if ( pTexture == GetFullFrameFrameBufferTexture( 0 ) )
-    {
-        pRenderContext->SetFrameBufferCopyTexture( pTexture, 0 );
-    }
-    else if ( pTexture == GetFullFrameFrameBufferTexture( 1 ) )
-    {
-        pRenderContext->SetFrameBufferCopyTexture( pTexture, 1 );
-    }
+    pRenderContext->CopyRenderTargetToTexture( pTexture );
 
     return 0;
 }
@@ -345,13 +333,21 @@ LUA_BINDING_END( "number", "The alpha blend." )
 LUA_BINDING_BEGIN( Renders, UpdateScreenEffectTexture, "library", "Update the screen effect texture.", "client" )
 {
     const CViewSetup *pViewSetup = view->GetViewSetup();
+
+    // HL2SB (2026-10-03): optional bDestFullScreen (arg 2).  The engine's own
+    // screen-effect consumers (DoImageSpaceMotionBlur and the bloom composite
+    // in viewpostprocess.cpp) pass true so the copy uses a NULL dest rect and
+    // "_rt_FullFrameFB is always 100% filled"; modules/halo.lua passes it too.
+    bool bDestFullScreen = luaL_optboolean( L, 2, 0 ) ? true : false;
+
     UpdateScreenEffectTexture(
         LUA_BINDING_ARGUMENT_WITH_DEFAULT(
             luaL_optnumber, 1, 0, "textureIndex" ),
         pViewSetup->x,
         pViewSetup->y,
         pViewSetup->width,
-        pViewSetup->height );
+        pViewSetup->height,
+        bDestFullScreen );
     return 0;
 }
 LUA_BINDING_END()
@@ -524,6 +520,7 @@ LUA_BINDING_BEGIN( Renders, Clear, "library", "Clears the current render target 
     bool bClearStencil = luaL_optboolean( L, 6, 0 ) ? true : false;
 
     CMatRenderContextPtr pRenderContext( materials );
+
     pRenderContext->ClearColor4ub( clr.r, clr.g, clr.b, clr.a );
     pRenderContext->ClearBuffers( true, bClearDepth, bClearStencil );
 
@@ -535,6 +532,10 @@ LUA_BINDING_END()
 LUA_BINDING_BEGIN( Renders, SetRenderTarget, "library", "Sets the render target to draw into.", "client" )
 {
     CMatRenderContextPtr pRenderContext( materials );
+    // Reference behaviour (decompiled): the binding flushes the context
+    // BEFORE the switch, so draws queued in the outgoing target are
+    // submitted to it and cannot bleed into the incoming one.
+    pRenderContext->Flush( false );
     if ( lua_isnoneornil( L, 1 ) )
     {
         pRenderContext->SetRenderTarget( NULL );
@@ -577,6 +578,50 @@ LUA_BINDING_BEGIN( Renders, PopRenderTarget, "library", "Pops a render target pu
 }
 LUA_BINDING_END()
 
+// render.GetSuperFPTex() / render.GetSuperFPTex2() -- GMod's portal-view
+// render targets.  Reference behaviour: two lazily created, name-keyed
+// literal-size render targets ("__rt_SuperTexture1" / "__rt_SuperTexture2",
+// 512x512), handed out as real ITexture userdata; repeat calls return the
+// same texture.  The portalgun renders the view through each portal into one
+// of these (SetRenderTarget -> Clear -> RenderView) and samples it back
+// through an UnlitGeneric $basetexture.
+static ITexture *HL2SB_GetSuperFPTex( int nIndex )
+{
+    static ITexture *s_pSuperFPTex[ 2 ] = { NULL, NULL };
+    if ( s_pSuperFPTex[ nIndex ] == NULL )
+    {
+        s_pSuperFPTex[ nIndex ] = materials->CreateNamedRenderTargetTextureEx2(
+            nIndex == 0 ? "__rt_SuperTexture1" : "__rt_SuperTexture2",
+            512, 512, RT_SIZE_LITERAL, IMAGE_FORMAT_RGBA8888,
+            MATERIAL_RT_DEPTH_SEPARATE,
+            TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_NOMIP | TEXTUREFLAGS_NOLOD,
+            0 );
+    }
+    return s_pSuperFPTex[ nIndex ];
+}
+
+LUA_BINDING_BEGIN( Renders, GetSuperFPTex, "library", "Returns the first SuperFP render target texture.", "client" )
+{
+    ITexture *pTexture = HL2SB_GetSuperFPTex( 0 );
+    if ( pTexture == NULL )
+        lua_pushnil( L );
+    else
+        lua_pushitexture( L, pTexture );
+    return 1;
+}
+LUA_BINDING_END( "Texture", "The SuperFP render target texture." )
+
+LUA_BINDING_BEGIN( Renders, GetSuperFPTex2, "library", "Returns the second SuperFP render target texture.", "client" )
+{
+    ITexture *pTexture = HL2SB_GetSuperFPTex( 1 );
+    if ( pTexture == NULL )
+        lua_pushnil( L );
+    else
+        lua_pushitexture( L, pTexture );
+    return 1;
+}
+LUA_BINDING_END( "Texture", "The second SuperFP render target texture." )
+
 // render.DrawScreenQuad() -- one quad over the current viewport with the
 // material set by render.SetMaterial.
 LUA_BINDING_BEGIN( Renders, DrawScreenQuad, "library", "Draws a fullscreen quad with the currently bound material.", "client" )
@@ -585,7 +630,124 @@ LUA_BINDING_BEGIN( Renders, DrawScreenQuad, "library", "Draws a fullscreen quad 
     IMaterial *pMaterial = s_pRendersLastSetMaterial;
     if ( pMaterial == NULL || pMaterial->IsErrorMaterial() )
         return luaL_error( L, "render.DrawScreenQuad: no material bound (call render.SetMaterial first)" );
+
     pRenderContext->DrawScreenSpaceQuad( pMaterial );
+    return 0;
+}
+LUA_BINDING_END()
+
+// render.RenderView( viewData ) -- GMod's recursive scene render: runs a full
+// world/entity draw into the CURRENT render target from inside a hook.  The
+// portalgun renders each portal's view into its own render target with this
+// (SetRenderTarget -> Clear -> RenderView -> UpdateScreenEffectTexture).
+// Fields, GMod wiki: origin, angles, x, y, w, h, fov, znear, zfar, aspect,
+// drawviewmodel (default true), drawhud (default false), ortho (table with
+// left/top/right/bottom).  Unset fields inherit the frame's own view, so a
+// nested render matches the screen the hook is drawing inside.
+LUA_BINDING_BEGIN( Renders, RenderView, "library", "Renders a scene view into the current render target.", "client" )
+{
+    luaL_checktype( L, 1, LUA_TTABLE );
+
+    CViewSetup viewSetup;
+    viewSetup.fov = 90.0f;
+    viewSetup.zNear = 4.0f;
+    viewSetup.zFar = 3000.0f;
+    viewSetup.x = 0;
+    viewSetup.y = 0;
+    viewSetup.width = 640;
+    viewSetup.height = 480;
+
+    const CViewSetup *pCurrent = view->GetViewSetup();
+    int nScreenWidth = 640, nScreenHeight = 480;
+    if ( pCurrent != NULL )
+    {
+        viewSetup = *pCurrent;
+        nScreenWidth = pCurrent->width;
+        nScreenHeight = pCurrent->height;
+    }
+    else
+    {
+        engine->GetScreenSize( nScreenWidth, nScreenHeight );
+        viewSetup.width = nScreenWidth;
+        viewSetup.height = nScreenHeight;
+        viewSetup.origin = vec3_origin;
+        viewSetup.angles = vec3_angle;
+    }
+
+    lua_getfield( L, 1, "origin" );
+    if ( !lua_isnil( L, -1 ) )
+        viewSetup.origin = luaL_checkvector( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "angles" );
+    if ( !lua_isnil( L, -1 ) )
+        viewSetup.angles = luaL_checkangle( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "x" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.x = (int)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "y" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.y = (int)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "w" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.width = (int)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "h" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.height = (int)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "fov" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.fov = (float)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "znear" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.zNear = (float)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "zfar" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.zFar = (float)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "aspect" );
+    if ( lua_isnumber( L, -1 ) ) viewSetup.m_flAspectRatio = (float)lua_tonumber( L, -1 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "ortho" );
+    if ( lua_istable( L, -1 ) )
+    {
+        viewSetup.m_bOrtho = true;
+        lua_getfield( L, -1, "left" );   viewSetup.m_OrthoLeft   = (float)luaL_optnumber( L, -1, 0.0f );  lua_pop( L, 1 );
+        lua_getfield( L, -1, "top" );    viewSetup.m_OrthoTop     = (float)luaL_optnumber( L, -1, 0.0f );  lua_pop( L, 1 );
+        lua_getfield( L, -1, "right" );  viewSetup.m_OrthoRight   = (float)luaL_optnumber( L, -1, 0.0f );  lua_pop( L, 1 );
+        lua_getfield( L, -1, "bottom" ); viewSetup.m_OrthoBottom  = (float)luaL_optnumber( L, -1, 0.0f );  lua_pop( L, 1 );
+    }
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "drawviewmodel" );
+    bool bDrawViewModel = lua_isnoneornil( L, -1 ) ? true : ( lua_toboolean( L, -1 ) != 0 );
+    lua_pop( L, 1 );
+
+    lua_getfield( L, 1, "drawhud" );
+    bool bDrawHud = lua_toboolean( L, -1 ) != 0;
+    lua_pop( L, 1 );
+
+    viewSetup.m_bRenderToSubrectOfLargerScreen =
+        ( viewSetup.x != 0 || viewSetup.y != 0 ||
+          viewSetup.width != nScreenWidth || viewSetup.height != nScreenHeight );
+
+    int whatToDraw = 0;
+    if ( bDrawViewModel )
+        whatToDraw |= RENDERVIEW_DRAWVIEWMODEL;
+    if ( bDrawHud )
+        whatToDraw |= RENDERVIEW_DRAWHUD;
+
+    // GMod renders color+depth and leaves the stencil to the caller
+    // (render.Clear does it first).
+    view->RenderView( viewSetup, VIEW_CLEAR_COLOR | VIEW_CLEAR_DEPTH, whatToDraw );
     return 0;
 }
 LUA_BINDING_END()

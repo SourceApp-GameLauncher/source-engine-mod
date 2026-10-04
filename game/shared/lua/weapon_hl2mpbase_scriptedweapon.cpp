@@ -597,6 +597,16 @@ void CHL2MPScriptedWeapon::InitScriptedWeapon( void )
 	}
 	lua_pop( L, 1 );
 
+	// HL2SB GMod compat (2026-10-03): SWEP.DeploySpeed seeds the weapon's
+	// deploy-speed scale (WEAPON:SetDeploySpeed); the member already defaults
+	// to 1.0, so an absent key changes nothing.
+	lua_pushweaponfield( L, m_nTableReference, "DeploySpeed" );
+	if ( lua_isnumber( L, -1 ) && lua_tonumber( L, -1 ) > 0.0f )
+	{
+		m_flDeploySpeed = lua_tonumber( L, -1 );
+	}
+	lua_pop( L, 1 );
+
 	lua_pushweaponfield( L, m_nTableReference, "rumble" );
 	if ( lua_isnumber( L, -1 ) )
 	{
@@ -1652,7 +1662,8 @@ bool HL2SB_GetWeaponTracerOrigin( CBaseEntity *pShooter, Vector &vecOut )
 
 	if ( luasrc_pcall( L, 1, 1, 0 ) != 0 )
 	{
-		// luasrc_pcall logged the traceback and popped the message
+		// error path leaves the nil placeholder (2026-10-04)
+		lua_pop( L, 1 );
 		return false;
 	}
 
@@ -1739,12 +1750,9 @@ bool HL2SB_ViewmodelFireAnimationEvent( C_BaseCombatWeapon *pWpn, const Vector &
 
 	if ( luasrc_pcall( L, 6, 1, 0 ) != 0 )
 	{
-		// On error luasrc_pcall logged the traceback and popped the message
-		// itself, so ONLY the weapon table is left here.  The success path
-		// pops 2 (result + table); doing that after an error pops one value
-		// past this frame - the next event dispatch then calls garbage/nil
-		// unprotected and aborts the process (2026-09-23 cf_beast crash).
-		lua_pop( L, 1 );
+		// Error path leaves [weapon table][nil placeholder] (2026-10-04);
+		// popping both matches the success path's pop of (result + table).
+		lua_pop( L, 2 );
 		return false;
 	}
 	// A non-boolean result (nil = "no opinion") lets the default event run.
@@ -1887,6 +1895,39 @@ void CHL2MPScriptedWeapon::Equip( CBaseCombatCharacter *pOwner )
 	}
 #endif
 #endif
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: HL2SB GMod compat (2026-10-03): WEAPON:OnRemove() -- GMod dispatches
+//          it right before a scripted weapon entity goes away (weapon_base
+//          stubs it; addons release sounds/particles there).  UpdateOnRemove
+//          is the entity-removal chain every scripted weapon walks.
+//-----------------------------------------------------------------------------
+void CHL2MPScriptedWeapon::UpdateOnRemove( void )
+{
+#if defined ( LUA_SDK )
+	BEGIN_LUA_CALL_WEAPON_METHOD( "OnRemove" );
+	END_LUA_CALL_WEAPON_METHOD( 0, 0 );
+#endif
+
+	BaseClass::UpdateOnRemove();
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: HL2SB GMod compat (2026-10-03): WEAPON:OnDrop() -- GMod dispatches
+//          it when the weapon is dropped.  Server only: the base Drop body is
+//          server-only too, so a client-side drop has nothing to hook.
+//-----------------------------------------------------------------------------
+void CHL2MPScriptedWeapon::Drop( const Vector &vecVelocity )
+{
+#ifndef CLIENT_DLL
+#if defined ( LUA_SDK )
+	BEGIN_LUA_CALL_WEAPON_METHOD( "OnDrop" );
+	END_LUA_CALL_WEAPON_METHOD( 0, 0 );
+#endif
+#endif
+
+	BaseClass::Drop( vecVelocity );
 }
 
 Activity CHL2MPScriptedWeapon::GetDrawActivity( void )
@@ -2689,8 +2730,9 @@ int CHL2MPScriptedWeapon::DispatchShouldDropOnDieVote( void )
 
 	if ( luasrc_pcall( L, 1, 1, 0 ) != 0 )
 	{
-		// luasrc_pcall logged the traceback and popped the message; the
-		// table went in as the argument, so nothing is left to pop
+		// error path leaves the nil placeholder (2026-10-04); the table
+		// went in as the argument and stays below it
+		lua_pop( L, 1 );
 		return -1;
 	}
 

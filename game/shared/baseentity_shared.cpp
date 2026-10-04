@@ -1698,6 +1698,19 @@ void CBaseEntity::FireBullets( const FireBulletsInfo_t &info )
 	const char *pszScriptedTracerName = HL2SB_ConsumeBulletTracerName();
 	Q_strncpy( s_szHL2SB_ShotTracerName, pszScriptedTracerName, sizeof( s_szHL2SB_ShotTracerName ) );
 
+#if defined( GAME_DLL ) && defined( LUA_SDK )
+	// HL2SB GMod compat (2026-10-03): hook.Run( "EntityFireBullets", ent, bullet )
+	// - GMod hands the shot's info to Lua before it flies.  Server realm only:
+	// the consumer this is for (the portalgun's bullet-through-portal relay)
+	// runs ents.FindByClass + its own FireBullets calls, which are server
+	// operations; firing the hook during client prediction would double the
+	// relay.  Local extern on purpose: waf has no header propagation.
+	{
+		extern bool HL2SB_LuaEntityFireBullets( CBaseEntity *pShooter, const FireBulletsInfo_t &info );
+		HL2SB_LuaEntityFireBullets( this, info );
+	}
+#endif
+
 	// HL2SB: wiki WEAPON:GetTracerOrigin() -> Vector -- a scripted weapon can
 	// move the visual source of this shot's tracers.  Asked once per shot and
 	// held in a local (the tracer NAME needs a static because MakeTracer() is
@@ -2094,37 +2107,10 @@ void CBaseEntity::FireBullets( const FireBulletsInfo_t &info )
 #endif
 		}
 
-		// HL2SB: per-shot, unbounded -- this one line decides between
-		// "the tracer branch never ran" (freq=0 / glass) and "it ran and
-		// MakeTracer is at fault".  Sits BEFORE the branch so a false
-		// condition still explains itself.  The realm tag is compile-time:
-		// both DLLs write the same log, and every round so far has had to
-		// guess which realm a line came from.
-#ifdef CLIENT_DLL
-		luasrc_LuaInfoMsgF(
-			"[HL2SB] cl FireBullets shot: freq=%d count=%d serverFx=%d impacted=%d water=%d glass=%d shotTracer='%s'\n",
-			info.m_iTracerFreq, tracerCount, bDoServerEffects ? 1 : 0,
-			( tr.m_pEnt != NULL ) ? 1 : 0, bHitWater ? 1 : 0, bHitGlass ? 1 : 0,
-			s_szHL2SB_ShotTracerName );
-#else
-		luasrc_LuaInfoMsgF(
-			"[HL2SB] sv FireBullets shot: freq=%d count=%d serverFx=%d impacted=%d water=%d glass=%d shotTracer='%s'\n",
-			info.m_iTracerFreq, tracerCount, bDoServerEffects ? 1 : 0,
-			( tr.m_pEnt != NULL ) ? 1 : 0, bHitWater ? 1 : 0, bHitGlass ? 1 : 0,
-			s_szHL2SB_ShotTracerName );
-#endif
-
 		if ( ( info.m_iTracerFreq != 0 ) && ( tracerCount++ % info.m_iTracerFreq ) == 0 && ( bHitGlass == false ) )
 		{
 			if ( bDoServerEffects == true )
 			{
-#ifdef CLIENT_DLL
-				// HL2SB: splits "the branch did not run" (no line) from
-				// "MakeTracer ran and its own line vanished" -- the 2026-09-19
-				// rounds had serverFx=1 on every client shot with zero
-				// MakeTracer lines, which the source above says is impossible.
-				luasrc_LuaInfoMsgF( "[HL2SB] cl tracer branch: firing MakeTracer\n" );
-#endif
 				Vector vecTracerSrc = vec3_origin;
 				ComputeTracerStartPosition( info.m_vecSrc, &vecTracerSrc );
 				// HL2SB: the scripted weapon's GetTracerOrigin() wins over

@@ -1623,6 +1623,93 @@ void CBasePlayer::CalcViewModelView( const Vector& eyeOrigin, const QAngle& eyeA
 	}
 }
 
+#if defined( CLIENT_DLL ) && defined( LUA_SDK )
+// HL2SB (2026-10-04): the GMod CalcView dispatch, called from
+// ClientModeShared::OverrideView -- GMod's single hook-id-4 call site lives in
+// the same stage of their SetUpViews flow (verified: the only
+// HookExists(ctx, 4) site, and their SetUpViews 0x1802e3d30 has no post-pass
+// rewriting the view afterwards).  Decompiled contract (GMod client.dll -- the single
+// HookExists(ctx, 4) call site): push copies of ( player, origin, angles, fov,
+// znear, zfar ), take ONE return value and read the CamData fields
+// origin/angles/fov/znear/zfar back with the current values as defaults.  GMod
+// never reads the pushed userdata back itself, but its base gamemode
+// GM:CalcView forwards the argument vectors into the returned view table BY
+// REFERENCE -- that is how in-place edits (First Person Body's eye-attachment
+// snap) reach the engine.  A returned table always wins; anything else keeps
+// the engine view.  pOutNear/pOutFar: only the vehicle path has znear/zfar
+// out-parameters.
+void HL2SB_LuaCalcView( CBasePlayer *pPlayer, Vector &eyeOrigin, QAngle &eyeAngles,
+							   float &fov, float flZNear, float flZFar,
+							   float *pOutNear = NULL, float *pOutFar = NULL )
+{
+	if ( L == NULL || !pPlayer->IsLocalPlayer() )
+		return;
+
+	int iBase = lua_gettop( L );
+
+	BEGIN_LUA_CALL_HOOK( "CalcView" );
+		lua_pushplayer( L, pPlayer );
+		lua_pushvector( L, eyeOrigin );
+		lua_pushangle( L, eyeAngles );
+		lua_pushnumber( L, fov );
+		lua_pushnumber( L, flZNear );
+		lua_pushnumber( L, flZFar );
+	END_LUA_CALL_HOOK( 6, 1 );
+
+	// END's pcall consumed the function and all eight arguments (hook.call
+	// name/gamemode + the six view values), so exactly ONE value sits above
+	// iBase now: the hook's return -- nil when nothing was returned or the
+	// call raised (the 0080ddd6 pcall convention keeps the result shape as a
+	// nil).  GMod reads the CamData table back per named field with the
+	// current values as defaults; a non-table keeps the engine view.
+	//
+	// Do NOT keep spare copies of the pushed arguments above the args here:
+	// luasrc_pcall pops its argument window from the TOP, so anything pushed
+	// past the args becomes part of the argument list -- the first revision
+	// of this helper pushed two origin/angles copies for a writeback fallback
+	// and that shifted the window onto the gamemode table, making every
+	// single frame call the GAMEMODE TABLE as if it were hook.call (the
+	// "callee at 3 is a table" probe signature, 2026-10-04).  In-place edits
+	// by hooks still reach the engine without any fallback: the base
+	// gamemode's GM:CalcView forwards the argument vectors into its returned
+	// view table by reference.
+	if ( lua_istable( L, -1 ) )
+	{
+		lua_getfield( L, -1, "origin" );
+		if ( lua_isuserdata( L, -1 ) && luaL_checkudata( L, -1, "Vector" ) )
+			eyeOrigin = luaL_checkvector( L, -1 );
+		lua_pop( L, 1 );
+
+		lua_getfield( L, -1, "angles" );
+		if ( lua_isuserdata( L, -1 ) && luaL_checkudata( L, -1, "QAngle" ) )
+			eyeAngles = luaL_checkangle( L, -1 );
+		lua_pop( L, 1 );
+
+		lua_getfield( L, -1, "fov" );
+		if ( lua_isnumber( L, -1 ) )
+			fov = luaL_checknumber( L, -1 );
+		lua_pop( L, 1 );
+
+		if ( pOutNear != NULL )
+		{
+			lua_getfield( L, -1, "znear" );
+			if ( lua_isnumber( L, -1 ) )
+				*pOutNear = luaL_checknumber( L, -1 );
+			lua_pop( L, 1 );
+
+			lua_getfield( L, -1, "zfar" );
+			if ( lua_isnumber( L, -1 ) )
+				*pOutFar = luaL_checknumber( L, -1 );
+			lua_pop( L, 1 );
+		}
+
+	}
+
+	lua_settop( L, iBase );	// exact restore
+}
+
+#endif // CLIENT_DLL && LUA_SDK
+
 void CBasePlayer::CalcPlayerView( Vector& eyeOrigin, QAngle& eyeAngles, float& fov )
 {
 #if defined( CLIENT_DLL )
@@ -1698,44 +1785,11 @@ void CBasePlayer::CalcPlayerView( Vector& eyeOrigin, QAngle& eyeAngles, float& f
 
 	lua_pop( L, 3 );
 
-#if defined( CLIENT_DLL )
-	// HL2SB GMod compat (2026-09-24): GM:CalcView - the GMod name for the view
-	// override, fired on the CLIENT realm only (the raw-value "CalcPlayerView"
-	// dispatch above is this fork's legacy hook and keeps working).  CalcView
-	// in GMod hands addons a CamData TABLE: { origin=Vector, angles=Angle,
-	// fov=n, znear=n, zfar=n, drawviewer=bool }.  This engine's CalcPlayerView
-	// has no clip-plane params, so znear/zfar are not dispatched and a table's
-	// znear/zfar/drawviewer are ignored - origin/angles/fov are applied, which
-	// is what the First Person Body addon (reads ply/vec/ang) needs.
-	if ( L != NULL )
-	{
-		BEGIN_LUA_CALL_HOOK( "CalcView" );
-			lua_pushplayer( L, this );
-			lua_pushvector( L, eyeOrigin );
-			lua_pushangle( L, eyeAngles );
-			lua_pushnumber( L, fov );
-		END_LUA_CALL_HOOK( 4, 1 );
-
-		if ( lua_istable( L, -1 ) )
-		{
-			lua_getfield( L, -1, "origin" );
-			if ( lua_isuserdata( L, -1 ) && luaL_checkudata( L, -1, "Vector" ) )
-				VectorCopy( luaL_checkvector( L, -1 ), eyeOrigin );
-			lua_pop( L, 1 );
-
-			lua_getfield( L, -1, "angles" );
-			if ( lua_isuserdata( L, -1 ) && luaL_checkudata( L, -1, "QAngle" ) )
-				VectorCopy( luaL_checkangle( L, -1 ), eyeAngles );
-			lua_pop( L, 1 );
-
-			lua_getfield( L, -1, "fov" );
-			if ( lua_isnumber( L, -1 ) )
-				fov = luaL_checknumber( L, -1 );
-			lua_pop( L, 1 );
-		}
-		lua_pop( L, 1 );
-	}
-#endif // CLIENT_DLL
+// HL2SB (2026-10-04): the GM:CalcView hook no longer fires from inside the
+// player's Calc functions -- GMod dispatches it from ClientMode::OverrideView
+// (client.dll, the single hook-id-4 site), AFTER the vehicle eye / third
+// person / bob stages have assembled the view, and nothing writes the view
+// afterwards.  See ClientModeShared::OverrideView in clientmode_shared.cpp.
 #endif
 }
 
@@ -1791,6 +1845,13 @@ void CBasePlayer::CalcVehicleView(
 	// inside the jeep") in the first place, because GetVehicleEnt() is player-backed on
 	// the client: "[HL2SB veh/cl] player=player vehicle=player" vs the server's
 	// "vehicle=prop_vehicle_jeep".
+	//
+	// HL2SB (2026-10-04, ROLLED BACK): dispatching GM:CalcView from here worked
+	// but activated First Person Body's in-vehicle branch, whose pose-zero ->
+	// forced SetupBones -> restore sequence inside the view pass made the
+	// seated model vibrate between the two poses every frame.  Rolled back per
+	// user report; the vehicle dispatch stays out until the addon-side frame
+	// ordering is solved (b58583e4..b4d639bf document everything learned).
 #endif
 
 }

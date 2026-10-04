@@ -13,6 +13,9 @@
 #include "sys_dll.h"
 #include "video/ivideoservices.h"
 #include "engine/IEngineSound.h"
+// HL2SB (2026-10-04): ThreadInterlockedExchangePointer for the S_FreeChannel
+// mixer ownership claim.
+#include "tier0/threadtools.h"
 
 #if defined( REPLAY_ENABLED )
 #include "demo.h"
@@ -428,16 +431,36 @@ void S_FreeChannel(channel_t *ch)
 		return;
 	ch->flags.m_bIsFreeingChannel = true;
 
+	// HL2SB (2026-10-04): the mixer teardown must have exactly ONE owner.
+	// The audio mix thread frees finished channels (MIX_MixChannelsToPaint-
+	// buffer) while the main thread steals channels for arriving sounds under
+	// g_SndMutex - a lock this function is not held under on the mix path.
+	// Both threads used to read the same ch->pMixer and delete it twice
+	// (the 2026-10-04 dumps: the deleting destructor read NULL+8 once and a
+	// garbage vtable pointer the second time).  Swap the pointer to NULL
+	// atomically - whoever receives the non-NULL mixer owns the teardown,
+	// and a re-entrant call from the stopped callback below loses the swap.
+	CAudioMixer *pMixer = (CAudioMixer *)ThreadInterlockedExchangePointer(
+		(void * volatile *)&ch->pMixer, NULL );
+	// The sfx companion check keeps the legitimate "never had a mixer"
+	// teardown (a vox sentence with zero words) on its old path.
+	if ( pMixer == NULL && ch->sfx == NULL )
+		return;
+
 	SND_CloseMouth(ch);
 
-	g_pSoundServices->OnSoundStopped( ch->guid, ch->soundsource, ch->entchannel, ch->sfx->getname() );
-
-	ch->flags.isSentence = false;
-//	Msg("End sound %s\n", ch->sfx->getname() );
-	
-	delete ch->pMixer;
-	ch->pMixer = NULL;
+	// Detach the sfx before the stopped callback: the callback runs game
+	// code (captions, sound hooks) which may start sounds and steal channels
+	// - it must observe an already emptied channel, or the steal deletes the
+	// same mixer a second time.
+	CSfxTable *sfx = ch->sfx;
 	ch->sfx = NULL;
+	ch->flags.isSentence = false;
+
+	if ( sfx )
+		g_pSoundServices->OnSoundStopped( ch->guid, ch->soundsource, ch->entchannel, sfx->getname() );
+
+	delete pMixer;	// deleting NULL is a no-op
 
 	// zero all data in channel
 	g_ActiveChannels.Remove( ch );
@@ -545,9 +568,20 @@ void MIX_MixChannelsToPaintbuffer( CChannelList &list, int endtime, int flags, i
 			continue;
 		}
 
+		// HL2SB (2026-10-04): the main thread may steal this channel (and
+		// atomically claim its mixer in S_FreeChannel) while we walk the mix
+		// list snapshot - a nulled pMixer here just means the teardown is
+		// owned elsewhere; drop it from this list and move on instead of
+		// dereferencing the empty slot.
+		if ( !ch->pMixer )
+		{
+			list.RemoveChannelFromList(i);
+			continue;
+		}
+
 		if ( bIsMouth )
 		{
-			if ( ( ch->soundsource == SOUND_FROM_UI_PANEL ) || entitylist->GetClientEntity(ch->soundsource) || 
+			if ( ( ch->soundsource == SOUND_FROM_UI_PANEL ) || entitylist->GetClientEntity(ch->soundsource) ||
 				( ch->flags.bSpeaker && entitylist->GetClientEntity( ch->speakerentity ) ) )
 			{
 				// UNDONE: recode this as a member function of CAudioMixer
@@ -2080,6 +2114,16 @@ void MIX_BuildChannelList( CChannelList &list )
 	for ( int i = list.Count(); --i >= 0; )
 	{
 		channel_t *ch = list.GetChannel(i);
+		// HL2SB (2026-10-04): a channel claimed for teardown on another thread
+		// (S_FreeChannel nulls the mixer atomically) must drop out of this
+		// snapshot - the teardown owner completes it.  The snapshot was taken
+		// before the claim, so the empty slot can be observed here (the
+		// 02:56 crash: IsReadyToMix on a nulled mixer, read at NULL+0x48).
+		if ( !ch->pMixer )
+		{
+			list.RemoveChannelFromList(i);
+			continue;
+		}
 		bool bRemove = false;
 		// Certain async loaded sounds lazily load into memory in the background, use this to determine
 		//  if the sound is ready for mixing
