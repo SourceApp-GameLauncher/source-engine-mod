@@ -1638,6 +1638,29 @@ void CBasePlayer::CalcViewModelView( const Vector& eyeOrigin, const QAngle& eyeA
 // snap) reach the engine.  A returned table always wins; anything else keeps
 // the engine view.  pOutNear/pOutFar: only the vehicle path has znear/zfar
 // out-parameters.
+
+// HL2SB (sbrust): the frame's view.drawviewer request, read back from the
+// CamData table by HL2SB_LuaCalcView below.  GMod's CalcView readback also takes
+// this boolean, and it feeds exactly one decision: whether the LOCAL PLAYER's
+// body is in the scene this view.  The vehicle third person camera (GMod's
+// GM:CalcVehicleView) sets it; the First Person Body already relies on the same
+// contract.  Cleared at the top of ClientModeShared::OverrideView (every view
+// pass), consumed by ClientModeShared::ShouldDrawLocalPlayer and
+// C_BasePlayer::LocalPlayerInFirstPersonView / ShouldDrawLocalPlayer.
+#if defined( CLIENT_DLL ) && defined( LUA_SDK )
+static bool s_bHL2SBLuaViewDrawViewer = false;
+
+void HL2SB_SetLuaViewDrawViewer( bool bSet )
+{
+	s_bHL2SBLuaViewDrawViewer = bSet;
+}
+
+bool HL2SB_GetLuaViewDrawViewer( void )
+{
+	return s_bHL2SBLuaViewDrawViewer;
+}
+#endif // CLIENT_DLL && LUA_SDK
+
 void HL2SB_LuaCalcView( CBasePlayer *pPlayer, Vector &eyeOrigin, QAngle &eyeAngles,
 							   float &fov, float flZNear, float flZFar,
 							   float *pOutNear = NULL, float *pOutFar = NULL )
@@ -1690,6 +1713,13 @@ void HL2SB_LuaCalcView( CBasePlayer *pPlayer, Vector &eyeOrigin, QAngle &eyeAngl
 			fov = luaL_checknumber( L, -1 );
 		lua_pop( L, 1 );
 
+		// HL2SB (sbrust): view.drawviewer (see s_bHL2SBLuaViewDrawViewer above).
+		// Absent/false keeps the engine's own first-person determination -- the
+		// frame default was cleared in OverrideView before the dispatch.
+		lua_getfield( L, -1, "drawviewer" );
+		HL2SB_SetLuaViewDrawViewer( lua_toboolean( L, -1 ) != 0 );
+		lua_pop( L, 1 );
+
 		if ( pOutNear != NULL )
 		{
 			lua_getfield( L, -1, "znear" );
@@ -1701,6 +1731,16 @@ void HL2SB_LuaCalcView( CBasePlayer *pPlayer, Vector &eyeOrigin, QAngle &eyeAngl
 			if ( lua_isnumber( L, -1 ) )
 				*pOutFar = luaL_checknumber( L, -1 );
 			lua_pop( L, 1 );
+		}
+
+		// HL2SB (2026-10-04, TEMPORARY): bisect instrumentation for the seated
+		// view chain -- shows whether this dispatch runs at all and what the
+		// readback applied.  Shares the veh-third-person debug throttle/channel
+		// ("luacalc" site, one line per second with hl2sb_veh_thirdperson_debug 1).
+		{
+			extern void HL2SB_DebugVehicleCamera( const char *pszWhere, const Vector &vecOrigin,
+											   const QAngle &angView, const char *pszDetail );
+			HL2SB_DebugVehicleCamera( "luacalc", eyeOrigin, eyeAngles, NULL );
 		}
 
 	}

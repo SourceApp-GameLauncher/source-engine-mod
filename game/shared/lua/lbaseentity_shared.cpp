@@ -4075,6 +4075,11 @@ static int CBaseEntity_SendLua (lua_State *L) {
 
 #include "datamap.h"			// datamap_t / typedescription_t / FIELD_* / TD_OFFSET_NORMAL
 #include "mathlib/lvector.h"	// lua_pushvector / luaL_checkvector / luaL_checkangle
+// HL2SB (sbrust): the six camera-state / vehicle-table-name accessors that the
+// Vehicle metatable also carries -- mirrored onto the entity metatable (the
+// registration at the Entitymeta table below) so chairs (prisoner pods, which
+// stay plain entities in this fork) answer them.
+#include "lvehicle_shared.h"
 
 // Push one data-description field as its Lua value.  Returns false for the field
 // kinds we do not expose (embedded classes, function pointers, arrays), so every
@@ -4797,6 +4802,17 @@ static const luaL_Reg CBaseEntitymeta[] = {
   {"SetVelocity", CBaseEntity_SetVelocity},
   {"IsValid", CBaseEntity_IsValid},
   {"IsVehicle", CBaseEntity_IsVehicle},
+  // HL2SB (sbrust): GMod hands chairs (prisoner pods) the same vehicle state
+  // methods it hands driveables -- here through the shared entity metatable
+  // (the functions themselves dispatch: driveable field / exported pod access /
+  // default). GM:CalcVehicleView's `Vehicle.GetThirdPersonMode == nil` guard
+  // relies on this for the seat camera; the Vehicle metatable keeps its copy.
+  {"GetThirdPersonMode", Vehicle_GetThirdPersonMode},
+  {"SetThirdPersonMode", Vehicle_SetThirdPersonMode},
+  {"GetCameraDistance", Vehicle_GetCameraDistance},
+  {"SetCameraDistance", Vehicle_SetCameraDistance},
+  {"GetVehicleClass", Vehicle_GetVehicleClass},
+  {"SetVehicleClass", Vehicle_SetVehicleClass},
   {"Activate", CBaseEntity_Activate},
   {"AddDataObjectType", CBaseEntity_AddDataObjectType},
   {"AddEffects", CBaseEntity_AddEffects},
@@ -4915,7 +4931,15 @@ static const luaL_Reg CBaseEntitymeta[] = {
   // never registered, so extensions/gmod_compat.lua's "GetTable = GetRefTable"
   // alias (and player.lua's __index fallback) saw nil.  Everything that indexes
   // ent:GetTable() (construct.lua, saverestore.lua, player.lua) depends on it.
+  //
+  // HL2SB (2026-10-05): register the GMod spelling as well - gmod_compat.lua
+  // is not in any load path (no include, no folder pass), so the alias never
+  // installed and every ent:GetTable() caller saw nil.  animations.lua's
+  // CalcMainActivity chain dies on it on the first dispatch, and once
+  // hook.lua's error path removes the gamemode method, every later dispatch
+  // answers nothing.
   {"GetRefTable", CBaseEntity_GetRefTable},
+  {"GetTable", CBaseEntity_GetRefTable},
   {"GetRenderColor", CBaseEntity_GetRenderColor},
   // HL2SB GMod compat: GMod's spellings of the same idea (a Color rather than a
   // normalised Vector), plus a material name that has no engine-side override.
